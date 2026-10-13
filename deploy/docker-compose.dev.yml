@@ -1,0 +1,44 @@
+# Local development: PostgreSQL 16 with the same "bridge" schema as production.
+#
+#   docker compose -f deploy/docker-compose.dev.yml up -d db
+#   printf 'DATABASE_URL=postgresql://bridge:bridge-dev@127.0.0.1:5432/bridge?sslmode=disable\n' > secrets/db.env
+#   make run                     # app on the host against this database
+#
+# Optional: run the app in a container too (profile "app"):
+#   docker compose -f deploy/docker-compose.dev.yml --profile app up --build
+# with secrets/db.env pointing at host "db" instead of 127.0.0.1.
+name: dhan_bridge_dev
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: ${DEV_PG_PASSWORD:-bridge-dev}   # local only, bound to loopback
+      POSTGRES_DB: bridge
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./dev/initdb.sql:/docker-entrypoint-initdb.d/01-bridge-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge -d bridge"]
+      interval: 5s
+      retries: 20
+
+  bridge:
+    profiles: ["app"]
+    build: ..
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      BRIDGE_MODE: replay
+      DB_SSLMODE: disable
+    volumes:
+      - ../secrets:/run/secrets:ro
+      - ../data:/app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  pgdata:

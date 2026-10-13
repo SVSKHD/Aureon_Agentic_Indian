@@ -1,7 +1,7 @@
 PY ?= .venv/bin/python
 PIP_COMPILE = $(PY) -m piptools compile --generate-hashes --allow-unsafe --strip-extras --quiet
 
-.PHONY: venv lock lint test check run
+.PHONY: venv lock lint test check run dev-db
 
 venv:
 	python3.11 -m venv .venv
@@ -23,6 +23,11 @@ test:
 
 check: lint test
 
+# Local PostgreSQL 16 with the production schema layout (see deploy/docker-compose.dev.yml)
+dev-db:
+	docker compose -f deploy/docker-compose.dev.yml up -d --wait db
+
 run:
 	BRIDGE_MODE=replay SECRETS_FILE=./secrets/dhan.env ADMIN_KEY_FILE=./secrets/admin.key \
+		DB_SECRETS_FILE=./secrets/db.env DB_SSLMODE=disable HEARTBEAT_ENABLED=false \
 		$(PY) -m uvicorn --factory dhan_bridge.api:create_app --workers 1 --port 8000

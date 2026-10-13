@@ -47,6 +47,7 @@ log = logging.getLogger(__name__)
 LAST_DEPLOY = "last-deploy.json"
 SIDECAR_SUFFIX = ".fingerprint.json"
 DEFAULT_KEEP = 30
+EXIT_NO_SCHEMA = 3  # `now`: the database has no bridge schema yet
 TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 ENABLE_RLS_ON_ALL = """
 DO $$
@@ -381,6 +382,11 @@ def main(argv: Sequence[str] | None = None, host: DockerHost | None = None) -> i
         if args.command == "now":
             if args.record_deploy and (not args.previous_tag or not args.target_tag):
                 parser.error("--record-deploy needs --previous-tag and --target-tag")
+            if not schema_exists(secrets.url, settings):
+                print(f'database has no schema "{SCHEMA}" yet: nothing to back up')
+                if args.record_deploy:  # never leave a stale record for a later rollback
+                    (backups_dir / LAST_DEPLOY).unlink(missing_ok=True)
+                return EXIT_NO_SCHEMA
             dump = consistent_dump(secrets, backups_dir, settings, prefix=args.prefix)
             print(f"backup={dump.path.name} revision={dump.fingerprint['alembic_revision']}")
             if args.record_deploy:

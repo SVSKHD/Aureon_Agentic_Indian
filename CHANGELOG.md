@@ -27,6 +27,7 @@ First release: foundation, packaging and CI/CD. No market feed yet (`feed: "not_
   `GET /health` returns `version, mode, token_ok, feed, market_open, db_ok`.
   `python -m dhan_bridge.health probe` is used by the Docker HEALTHCHECK, the smoke test and the deploy gates.
 - Versioned SQLite migrations with a backup before applying (`data/backups/`, last 30 kept).
+  *(Superseded before release by PostgreSQL + Alembic, see below.)*
 - No-trade invariant test (`tests/test_no_trade.py`) and README "Safety" section.
 - Hash-locked dependencies (pip-compile `--generate-hashes`), multi-stage
   non-root Dockerfile (single uvicorn worker), prod and staging compose files,
@@ -68,3 +69,41 @@ First release: foundation, packaging and CI/CD. No market feed yet (`feed: "not_
   HTTP layer refuses order and account-mutating endpoints.
 - **Logging:** the redactor also scrubs tracebacks (`exc_text`) and `stack_info`.
 - **Tasks:** token-recheck tasks remove themselves from `state.tasks` when done.
+
+### Storage: PostgreSQL on Supabase + host migration tooling
+- **PostgreSQL replaces SQLite** (no SQLite anywhere; a test enforces it).
+  - **Driver and pool:** SQLAlchemy 2 + psycopg 3, a small sync pool (3 + 2 overflow, pre-ping, 10 s connect timeout).
+  - **Connection URL:** `sslmode` defaults to `require`. `DATABASE_URL` is read only from `/run/secrets/db.env`, hot-reloaded like `dhan.env`, with the password masked everywhere.
+  - **Supabase:** session pooler (IPv4) or direct URL; never the transaction pooler. No Supabase SDK, Auth, PostgREST, Storage or Edge Functions: Python is the only database client.
+- **Schema `bridge` only**, `search_path` set per connection, **RLS enabled on every table with no policies**. The app connects as the owner. The README warns never to expose `bridge` in Supabase's Data API.
+- **Alembic replaces the custom runner:**
+  - **Revisions:** `0001_initial`, `0002_api_keys`, `0003_heartbeat`, `0004_enable_rls`.
+  - **Tests enforce:** expand-only revisions (`# -- allow-destructive: <reason>` to override), models == revisions (autogenerate finds nothing), and a single linear chain.
+- **Portability rules** (tests): standard Postgres types only, money `NUMERIC(18,4)`, `TIMESTAMPTZ` everywhere (UTC stored, IST shown), no extensions (empty allowlist), and no references to Supabase schemas or `public`.
+- **Instruments cache** replaced in one transaction with a bulk `COPY`. A failed download *or* load keeps the stale cache.
+- **Resilience:**
+  - **Startup:** live startup fails fast without the database. Replay starts anyway and retries in the background.
+  - **Outages after startup:** `/health` shows `db_ok: false`, `/api` answers 503, and background writes retry with exponential backoff.
+  - **`db_ok`:** `SELECT 1` within 3 s **and** `alembic current == head`.
+- **Heartbeat:** a daily single-row write to `bridge.heartbeat` keeps a free Supabase project from pausing.
+- **`dhan_bridge.dbverify`:** fingerprints (Alembic revision, server major, exact row counts, NUMERIC sums, TIMESTAMPTZ min/max, discovered from metadata) and `compare()`.
+- **Backups** (host side, `deploy/ops.sh backup ...`; pg tools run in `postgres:<major>-alpine` containers, never in the bridge image):
+  - **`now`:** a REPEATABLE READ snapshot, `pg_export_snapshot()`, the fingerprint in the same transaction, then `pg_dump -Fc --schema=bridge --snapshot=<id>`.
+  - **`verify`:** restores into a throwaway plain Postgres and compares fingerprints.
+  - **`restore`:** refuses while the bridge runs, takes a safety dump, swaps schemas atomically and verifies.
+  - **`rollback-plan`** and **`prune`**.
+- **Nightly job** (`deploy/backup-nightly.sh` + systemd timer): `now`, `verify`, off-host copy (rsync/rclone), prune to 30, optional Discord alert. Works by hand too.
+- **Pre-deploy dump and rollback:** the pre-deploy dump plus `last-deploy.json` (Alembic revision, previous tag) and the schema-aware rollback now use these commands.
+- **`deploy/db-move.sh` / `dhan_bridge.dbmove`** moves the data to any other Postgres host:
+  - **Preflight:** market hours, target version, empty target, disk.
+  - **Copy and verify:** a consistent copy, fingerprint-verified on the target.
+  - **Switch:** an atomic `db.env` switch with a health gate and automatic fallback; `--dry-run` and `--revert`.
+  - **Log and safety:** a JSON log per run in `data/migrations-log/`. The source is never modified.
+- **Compose:**
+  - **Prod and staging:** no database service; `db.env` in the secrets dir.
+  - **`deploy/docker-compose.dev.yml`:** local PostgreSQL 16 with the same schema.
+- **CI:**
+  - **Tests:** run against real throwaway PostgreSQL containers.
+  - **Smoke test:** runs the image against a throwaway Postgres on a private network.
+  - **New stage "DB portability":** a real 16 → 17 move between throwaway servers.
+

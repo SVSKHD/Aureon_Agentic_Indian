@@ -2,6 +2,8 @@
 //
 // Agent requirements: python3.11, docker (with access to the daemon that builds
 // the image), git, ssh/scp, curl. gitleaks and trivy run as pinned containers.
+// Tests need real PostgreSQL: they start throwaway postgres:<major>-alpine containers
+// through the same docker daemon (or use TEST_PG_ADMIN_URL if a sidecar is provided).
 // Jenkins plugins: Pipeline, Git, SSH Agent, Credentials Binding, JUnit, Coverage,
 // Timestamper, and Basic Branch Build Strategies (to build tags; see README).
 //
@@ -74,6 +76,8 @@ pipeline {
         GITLEAKS_IMG  = 'zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f'
         TRIVY_IMG     = 'aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa'
         PY            = '.venv/bin/python'
+        // Throwaway servers for tests / smoke (formatted with the server major).
+        PG_TEST_IMAGE = 'postgres:{major}-alpine'
     }
 
     stages {
@@ -123,6 +127,8 @@ pipeline {
                 stage('Test') {
                     steps {
                         mark('Test')
+                        // Real PostgreSQL only (no SQLite fallback): tests start their own
+                        // throwaway postgres containers via the agent's docker daemon.
                         sh '''
                             $PY -m pytest -q \
                                 --junitxml=reports/junit.xml \
@@ -143,6 +149,19 @@ pipeline {
                         mark('Safety: no-trade')
                         // Static grep + runtime SDK guard.
                         sh '$PY -m pytest -q tests/test_no_trade.py tests/test_runtime_guard.py --junitxml=reports/junit-no-trade.xml'
+                    }
+                }
+
+                stage('DB portability') {
+                    steps {
+                        mark('DB portability')
+                        // A full db-move between two throwaway PostgreSQL servers (16 -> 17),
+                        // fingerprint-verified, plus fallback/revert paths. Hard gate: if the
+                        // data can't move hosts, the release doesn't ship.
+                        sh '''
+                            $PY -m pytest -q tests/test_dbmove.py tests/test_portability.py \
+                                --junitxml=reports/junit-db-portability.xml
+                        '''
                     }
                 }
 
@@ -228,18 +247,33 @@ pipeline {
                 stage('Smoke test') {
                     steps {
                         mark('Smoke test')
-                        // On tags this runs against the promoted (pulled) image.
+                        // On tags this runs against the promoted (pulled) image. The image talks
+                        // to a throwaway postgres on a private docker network, exactly like prod
+                        // talks to Supabase: DATABASE_URL from /run/secrets/db.env.
                         sh '''
                             name="dhan-smoke-$BUILD_NUMBER-$GIT_SHA"
-                            trap 'docker logs "$name" > reports/smoke.log 2>&1 || true; docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+                            net="$name-net"; pg="$name-pg"
+                            pgpass="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+                            cleanup() {
+                                docker logs "$name" > reports/smoke.log 2>&1 || true
+                                docker rm -f "$name" "$pg" >/dev/null 2>&1 || true
+                                docker network rm "$net" >/dev/null 2>&1 || true
+                            }
+                            trap cleanup EXIT
+                            docker network create "$net" >/dev/null
+                            POSTGRES_PASSWORD="$pgpass" docker run -d --name "$pg" --network "$net" \
+                                -e POSTGRES_PASSWORD "$(echo "$PG_TEST_IMAGE" | sed 's/{major}/16/')" >/dev/null
                             mkdir -p .smoke/secrets
-                            printf 'DHAN_CLIENT_ID=0000000000\\nDHAN_ACCESS_TOKEN=smoke-test-not-a-real-token\\n' > .smoke/secrets/dhan.env
-                            docker create --name "$name" -e BRIDGE_MODE=replay "$IMAGE:$GIT_SHA" >/dev/null
+                            printf 'DHAN_CLIENT_ID=0000000000\nDHAN_ACCESS_TOKEN=smoke-test-not-a-real-token\n' > .smoke/secrets/dhan.env
+                            printf 'DATABASE_URL=postgresql://postgres:%s@%s:5432/postgres?sslmode=disable\n' "$pgpass" "$pg" > .smoke/secrets/db.env
+                            for i in $(seq 1 30); do docker exec "$pg" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+                            docker create --name "$name" --network "$net" -e BRIDGE_MODE=replay "$IMAGE:$GIT_SHA" >/dev/null
                             # docker cp (not a bind mount) works even when the agent itself runs in a container.
                             docker cp .smoke/secrets "$name:/run/secrets"
                             docker start "$name" >/dev/null
                             for i in $(seq 1 30); do
-                                # docker exec => loopback peer => full /health payload
+                                # docker exec => loopback peer => full /health payload; --strict needs
+                                # db_ok (SELECT 1 + alembic at head) and token_ok == null in replay
                                 if docker exec "$name" python -m dhan_bridge.health probe --strict \
                                        --expect-mode replay --expect-version "$VERSION"; then
                                     exit 0
@@ -297,7 +331,7 @@ pipeline {
                             sh '''
                                 scp $SSH_OPTS deploy/docker-compose.staging.yml "$STAGING_HOST:$REMOTE_DIR/docker-compose.yml"
                                 scp $SSH_OPTS deploy/nginx.conf "$STAGING_HOST:$REMOTE_DIR/nginx.conf"
-                                scp $SSH_OPTS deploy/remote-deploy.sh deploy/backup-offsite.sh "$STAGING_HOST:$REMOTE_DIR/"
+                                scp $SSH_OPTS deploy/remote-deploy.sh deploy/ops.sh deploy/db-move.sh deploy/backup-nightly.sh "$STAGING_HOST:$REMOTE_DIR/"
                                 ssh $SSH_OPTS "$STAGING_HOST" "bash -s -- deploy $GIT_SHA" < deploy/remote-deploy.sh
                                 ssh $SSH_OPTS "$STAGING_HOST" "bash -s -- health 90 --expect-version $VERSION" < deploy/remote-deploy.sh
                             '''
@@ -379,12 +413,12 @@ pipeline {
                             script: 'ssh $SSH_OPTS "$PROD_HOST" "bash -s -- current-tag" < deploy/remote-deploy.sh').trim()
                         echo "PREVIOUS=${env.PREVIOUS ?: '(none)'}"
 
-                        // Deploy (takes a pre-deploy SQLite backup first) + strict health gate:
+                        // Deploy (takes a consistent pg_dump of schema bridge first) + strict health gate:
                         // HTTP 200, db_ok, and token_ok == true in live mode, within 120 s.
                         def ok = sh(returnStatus: true, script: '''
                             scp $SSH_OPTS deploy/docker-compose.prod.yml "$PROD_HOST:$REMOTE_DIR/docker-compose.yml" &&
                             scp $SSH_OPTS deploy/nginx.conf "$PROD_HOST:$REMOTE_DIR/nginx.conf" &&
-                            scp $SSH_OPTS deploy/remote-deploy.sh deploy/backup-offsite.sh "$PROD_HOST:$REMOTE_DIR/" &&
+                            scp $SSH_OPTS deploy/remote-deploy.sh deploy/ops.sh deploy/db-move.sh deploy/backup-nightly.sh "$PROD_HOST:$REMOTE_DIR/" &&
                             ssh $SSH_OPTS "$PROD_HOST" "bash -s -- deploy $VERSION" < deploy/remote-deploy.sh &&
                             ssh $SSH_OPTS "$PROD_HOST" "bash -s -- health 120 --strict --expect-version $VERSION" < deploy/remote-deploy.sh
                         ''') == 0

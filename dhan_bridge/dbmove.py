@@ -223,17 +223,27 @@ def preflight(
 
 
 def _atomic_write_like(reference: Path, content: str, dest: Path) -> None:
-    """Write ``content`` to ``dest`` atomically, with ``reference``'s mode."""
+    """Write ``content`` to ``dest`` atomically with ``reference``'s mode, owner and group.
+
+    The container reads db.env as uid/gid 10001: a file rewritten by root (or by the
+    deploy user) must keep the original group, or the bridge can't read its own
+    database URL after the switch.
+    """
     tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
     tmp.write_text(content, encoding="utf-8")
     if reference.exists():
+        st = reference.stat()
+        try:
+            os.chown(tmp, st.st_uid if os.geteuid() == 0 else -1, st.st_gid)
+        except PermissionError:
+            log.warning("could not set group %s on %s; check its permissions", st.st_gid, dest)
         shutil.copymode(reference, tmp)
     os.replace(tmp, dest)
 
 
 def switch_secrets(db_env: Path, target_secrets: Path) -> Path:
     previous = db_env.with_name(db_env.name + ".previous")
-    shutil.copy2(db_env, previous)
+    _atomic_write_like(db_env, db_env.read_text(encoding="utf-8"), previous)
     _atomic_write_like(db_env, target_secrets.read_text(encoding="utf-8"), db_env)
     return previous
 
@@ -390,7 +400,7 @@ def run_revert(
         file=sys.stderr,
     )
     moved = db_env.with_name(db_env.name + ".moved")
-    shutil.copy2(db_env, moved)
+    _atomic_write_like(db_env, db_env.read_text(encoding="utf-8"), moved)
     restore_previous(db_env)
     mlog.step("db_env_reverted", saved_as=moved.name)
     host.restart()

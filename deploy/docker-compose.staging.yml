@@ -4,8 +4,11 @@
 # Host layout (see README "Deployment"):
 #   /opt/dhan_bridge/.env            compose variables: REGISTRY, BRIDGE_TAG (BRIDGE_TAG is rewritten by Jenkins)
 #   /opt/dhan_bridge/bridge.env      non-secret app settings (BRIDGE_MODE, PAPER_CAPITAL, ...)
-#   /opt/dhan_bridge/secrets/        dhan.env + admin.key, owned by uid 10001, mode 0400
-#   /opt/dhan_bridge/data/           SQLite + backups, owned by uid 10001
+#   /opt/dhan_bridge/secrets/        dhan.env, db.env (DATABASE_URL), admin.key; group 10001, mode 0440
+#   /opt/dhan_bridge/data/           backups/ (pg dumps), migrations-log/, bridge.lock; group 10001
+#
+# There is NO database service here: PostgreSQL is external (Supabase, session
+# pooler or direct connection; any other Postgres host works the same way).
 #   /opt/dhan_bridge/nginx.conf, certs/fullchain.pem, certs/privkey.pem
 name: dhan_bridge_staging
 
@@ -22,11 +25,16 @@ services:
     environment:
       BRIDGE_MODE: ${BRIDGE_MODE:-replay}
       SECRETS_FILE: /run/secrets/dhan.env
+      DB_SECRETS_FILE: /run/secrets/db.env
+      # DB_SSLMODE (default "require") belongs in bridge.env, which ops.sh reads too:
+      # an `environment:` entry here would silently override bridge.env.
       ADMIN_KEY_FILE: /run/secrets/admin.key
+      # keeps a free Supabase project from pausing after 7 idle days
+      HEARTBEAT_ENABLED: "true"
     volumes:
       - ./data:/app/data
       # The secrets DIRECTORY is mounted (read-only) so that an atomic `mv` of a new
-      # dhan.env on the host is visible in the container. A single-file bind mount
+      # dhan.env / db.env on the host is visible in the container. A single-file bind mount
       # pins the old inode and would silently keep serving the expired token.
       - ./secrets:/run/secrets:ro
     ports:

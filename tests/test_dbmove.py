@@ -265,3 +265,35 @@ def test_revert(source, pg17: PgServer, tmp_path: Path, capsys: pytest.CaptureFi
     assert read_db_secrets_file(settings.db_secrets_file.with_name("db.env.moved")).url == url
     assert "NOT copied back" in capsys.readouterr().err
     assert logs(settings)[-1]["result"] == "reverted"
+
+
+def test_switched_db_env_keeps_owner_group_and_mode(tmp_path: Path) -> None:
+    """The bridge reads db.env via its group: a switch must not reset owner/group/mode."""
+    import os
+    import stat
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    db_env = secrets / "db.env"
+    write_db_secrets(db_env, "postgresql://a:b@old-host:5432/db")
+    os.chmod(db_env, 0o440)
+    if os.geteuid() == 0:
+        os.chown(db_env, 10001, 10001)  # as on the host: readable by the container's group
+    target = tmp_path / "target.env"
+    write_db_secrets(target, "postgresql://a:b@new-host:5432/db")
+    os.chmod(target, 0o600)
+
+    ref = db_env.stat()
+    previous = dbmove.switch_secrets(db_env, target)
+    for path in (db_env, previous):
+        st = path.stat()
+        assert (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) == (
+            ref.st_uid,
+            ref.st_gid,
+            0o440,
+        ), path.name
+    assert "new-host" in db_env.read_text()
+    dbmove.restore_previous(db_env)
+    st = db_env.stat()
+    assert (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) == (ref.st_uid, ref.st_gid, 0o440)
+    assert "old-host" in db_env.read_text()
