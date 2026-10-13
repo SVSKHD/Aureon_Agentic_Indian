@@ -2,7 +2,8 @@
 
 * HTTP: ``Authorization: Bearer <key>`` on every ``/api/*`` route
   (:func:`require_api_key`, attached to the ``/api`` router).
-* WebSocket (prepared for P2): :func:`authenticate_websocket` accepts the key
+* WebSocket (prepared for P2): :func:`authenticate_websocket` first rejects any
+  browser Origin not in ALLOWED_ORIGINS (HTTP 403), then accepts the key
   either in ``Sec-WebSocket-Protocol`` (``bearer.<key>``, alongside
   ``dhan-bridge.v1``) or as the first message. Keys in the query string are
   refused outright: query strings end up in nginx access logs.
@@ -16,7 +17,10 @@ import json
 from collections.abc import Callable
 
 from fastapi import HTTPException, Request, WebSocket, status
+from starlette.responses import PlainTextResponse
 
+from dhan_bridge.cors import origin_allowed
+from dhan_bridge.db import DatabaseUnavailable
 from dhan_bridge.keys import ApiKey
 
 WS_APP_PROTOCOL = "dhan-bridge.v1"
@@ -58,13 +62,33 @@ def _verifier(request: Request | WebSocket) -> KeyVerifier:
     return verify
 
 
+DB_UNAVAILABLE = HTTPException(
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    detail="database unavailable",
+    headers={"Retry-After": "30"},
+)
+
+
 def request_api_key(request: Request) -> ApiKey | None:
+    """Raises DatabaseUnavailable if the key cannot be checked right now."""
     return _verifier(request)(bearer_token(request.headers.get("authorization")))
 
 
+def optional_api_key(request: Request) -> ApiKey | None:
+    """Like request_api_key, but a database outage just means 'not authenticated'."""
+    try:
+        return request_api_key(request)
+    except DatabaseUnavailable:
+        return None
+
+
 async def require_api_key(request: Request) -> ApiKey:
-    """FastAPI dependency: 401 unless a valid, unrevoked bearer key is presented."""
-    key = request_api_key(request)
+    """FastAPI dependency: 401 unless a valid, unrevoked bearer key is presented
+    (503 if the database cannot be asked)."""
+    try:
+        key = request_api_key(request)
+    except DatabaseUnavailable:
+        raise DB_UNAVAILABLE from None
     if key is None:
         raise UNAUTHORIZED
     request.state.api_key = key
@@ -106,6 +130,13 @@ async def authenticate_websocket(
     the key) and the key record is returned. On failure the socket is closed and
     None is returned; the caller must simply return.
     """
+    # 1. Origin first: a browser page from an origin we don't serve is refused with
+    #    HTTP 403 before any key is looked at.
+    allowed: list[str] = getattr(websocket.app.state, "allowed_origins", [])
+    if not origin_allowed(websocket.headers.get("origin"), allowed):
+        await websocket.send_denial_response(PlainTextResponse("origin not allowed", 403))
+        return None
+
     verify = _verifier(websocket)
     if QUERY_KEY_PARAMS & {k.lower() for k in websocket.query_params}:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="no keys in URLs")
@@ -117,7 +148,7 @@ async def authenticate_websocket(
 
     header_key = ws_protocol_key(header)
     if header_key is not None:
-        record = verify(header_key)
+        record = _safe_verify(verify, header_key)
         if record is None:
             await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="invalid API key")
             return None
@@ -130,9 +161,16 @@ async def authenticate_websocket(
     except (TimeoutError, KeyError, RuntimeError):
         await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="authentication timeout")
         return None
-    record = verify(_first_message_key(first))
+    record = _safe_verify(verify, _first_message_key(first))
     if record is None:
         await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="invalid API key")
         return None
     await websocket.send_json({"type": "auth_ok", "key_id": record.id})
     return record
+
+
+def _safe_verify(verify: KeyVerifier, key: str | None) -> ApiKey | None:
+    try:
+        return verify(key)
+    except DatabaseUnavailable:
+        return None

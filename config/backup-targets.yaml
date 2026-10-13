@@ -1,0 +1,22 @@
+# Off-site copies for scripts/backup-nightly.sh (python -m dhan_bridge.backup offsite).
+#
+# Every target receives the newest verified dump, its .fingerprint.json sidecar and
+# last-deploy.json. A failure on any target fails the nightly run (and sends the
+# optional Discord alert). With no targets the dump stays on this host only.
+#
+# This shipped file is an EXAMPLE: everything is commented out. Configure real
+# targets on the deploy host (or point BACKUP_TARGETS_FILE at another file).
+#
+# targets:
+#   # rsync over SSH. The key must be readable by the user running the nightly job;
+#   # the remote host key must already be in known_hosts (StrictHostKeyChecking=yes).
+#   - name: nas
+#     type: rsync
+#     host: backup@nas.example.internal
+#     path: /srv/backups/dhan_bridge/
+#     ssh_key: /home/deploy/.ssh/backup_ed25519
+#
+#   # rclone: any configured remote (rclone config lives with the running user).
+#   - name: cloud
+#     type: rclone
+#     remote: b2-backups:dhan-bridge/postgres

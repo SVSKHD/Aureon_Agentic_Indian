@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -77,13 +76,18 @@ def test_reduced_public_payload_fails_probe() -> None:
     assert health.evaluate(200, {"status": "ok", "version": "0.1.0"}) != []
 
 
-def test_db_ok(tmp_path: Path) -> None:
-    from dhan_bridge.migrations import migrate
+def test_db_ok(db_url: str) -> None:
+    from dhan_bridge.config import DatabaseSecrets
+    from dhan_bridge.db import Database
 
-    db = tmp_path / "x.db"
-    assert health.db_ok(db) is False
-    migrate(db, tmp_path / "b", "t")
-    assert health.db_ok(db) is True
+    database = Database(DatabaseSecrets(db_url), "disable")
+    try:
+        assert asyncio.run(health.db_ok(database)) is False  # reachable but not migrated
+        database.migrate()
+        assert asyncio.run(health.db_ok(database)) is True
+    finally:
+        database.dispose()
+    assert asyncio.run(health.db_ok(None)) is False
 
 
 def test_monitor_handles_missing_and_crashing_clients() -> None:

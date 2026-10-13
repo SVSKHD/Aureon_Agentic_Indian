@@ -1,185 +1,322 @@
+"""Backups with real psql/pg_dump/pg_restore inside postgres containers (never on the host)."""
+
 from __future__ import annotations
 
 import json
-import sqlite3
+from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
-from dhan_bridge import backup
-from dhan_bridge.migrations import Migration, migrate
-
-V1 = Migration(1, "a", "CREATE TABLE a (x INTEGER);")
-V2 = Migration(2, "b", "CREATE TABLE b (y INTEGER);")
+from dhan_bridge import backup, pgtools
+from dhan_bridge.config import Settings, read_db_secrets_file
+from dhan_bridge.db import Database
+from dhan_bridge.instruments import InstrumentStore
+from dhan_bridge.pgtools import ExecRunner, PgRunner, PgToolError
+from tests.conftest import FakeHost, export_ops_env
 
 
 @pytest.fixture
-def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    data = tmp_path / "data"
-    migrate(data / "bridge.db", data / "backups", "0.1.0", migrations=[V1])
-    monkeypatch.setenv("DATA_DIR", str(data))
-    return data
+def env(
+    make_settings: Callable[..., Settings], scrip_csv: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Settings, Database]:
+    settings = make_settings()
+    export_ops_env(monkeypatch, settings)
+    db = Database(read_db_secrets_file(settings.db_secrets_file), "disable")
+    db.migrate()
+    InstrumentStore(db).load_csv(scrip_csv, date(2026, 10, 13))
+    yield settings, db  # type: ignore[misc]
+    db.dispose()
 
 
-def rows(db: Path, table: str) -> list[tuple[int]]:
-    conn = sqlite3.connect(db)
-    try:
-        return conn.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608 - test helper
-    finally:
-        conn.close()
+def count(db: Database, table: str = "instruments") -> int:
+    with db.connect() as conn:
+        return int(conn.execute(text(f"SELECT count(*) FROM bridge.{table}")).scalar_one())
 
 
-def insert(db: Path, value: int) -> None:
-    conn = sqlite3.connect(db)
-    with conn:
-        conn.execute("INSERT INTO a VALUES (?)", (value,))
-    conn.close()
+def run(args: list[str], host: FakeHost | None = None) -> int:
+    return backup.main(args, host=host or FakeHost(running=False))
 
 
-def test_now_verify_and_schema_version(data_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert backup.main(["now"]) == 0
-    out = capsys.readouterr().out
-    assert "schema_version=1" in out
-    name = out.split("backup=")[1].split()[0]
-    assert (data_dir / "backups" / name).is_file()
-    assert backup.main(["verify", name]) == 0
-    assert "OK: ok" in capsys.readouterr().out
+def latest(settings: Settings) -> Path:
+    return backup.list_dumps(settings.backups_dir)[-1]
 
 
-def test_now_is_safe_while_app_runs(data_dir: Path) -> None:
-    lock = backup.acquire_instance_lock(data_dir)
-    try:
-        assert backup.is_app_running(data_dir) is True
-        assert backup.main(["now"]) == 0  # online backup: allowed while running
-    finally:
-        lock.close()
-    assert backup.is_app_running(data_dir) is False
+def test_now_writes_dump_and_fingerprint_sidecar(env: tuple[Settings, Database]) -> None:
+    settings, db = env
+    assert run(["now"]) == 0
+    dump = latest(settings)
+    meta = json.loads(backup.sidecar_for(dump).read_text())
+    assert dump.name.startswith("bridge-")
+    assert dump.suffix == ".dump"
+    assert meta["fingerprint"]["alembic_revision"] == db.head
+    assert meta["fingerprint"]["tables"]["instruments"]["rows"] == 10
+    assert meta["dump_sha256"] == backup.sha256_file(dump)
+    assert "password" not in json.dumps(meta).lower()
+    assert db_url_password(settings) not in json.dumps(meta)
 
 
-def test_verify_detects_corruption(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    bad = tmp_path / "bad.db"
-    bad.write_bytes(b"SQLite format 3\x00" + b"\x00" * 50 + b"garbage" * 200)
-    assert backup.main(["verify", str(bad)]) == 1
-    assert "CORRUPT" in capsys.readouterr().out
-    assert backup.verify(tmp_path / "missing.db")[0] is False
+def db_url_password(settings: Settings) -> str:
+    return read_db_secrets_file(settings.db_secrets_file).password
 
 
-def test_restore_refuses_while_running_unless_forced(data_dir: Path) -> None:
-    db = data_dir / "bridge.db"
-    insert(db, 1)
-    snapshot = backup.take_backup(db, data_dir / "backups")
-    insert(db, 2)
-
-    lock = backup.acquire_instance_lock(data_dir)
-    try:
-        assert backup.main(["restore", snapshot.name]) == 2
-        assert rows(db, "a") == [(1,), (2,)]
-        assert backup.main(["restore", snapshot.name, "--force"]) == 0
-    finally:
-        lock.close()
-    assert rows(db, "a") == [(1,)]
+def own_runner(settings: Settings) -> PgRunner:
+    return pgtools.runner_for(read_db_secrets_file(settings.db_secrets_file).url, settings)
 
 
-def test_restore_keeps_a_safety_copy(data_dir: Path) -> None:
-    db = data_dir / "bridge.db"
-    insert(db, 1)
-    snapshot = backup.take_backup(db, data_dir / "backups")
-    insert(db, 2)
-    safety = backup.restore(snapshot, db, data_dir / "backups", data_dir)
-    assert rows(db, "a") == [(1,)]
-    assert safety is not None
-    assert rows(safety, "a") == [(1,), (2,)]
+def test_own_database_uses_exec_runner(env: tuple[Settings, Database]) -> None:
+    settings, _ = env
+    runner = own_runner(settings)
+    assert isinstance(runner, ExecRunner)  # docker exec into the server: no password needed
+    assert "@/" in runner.url  # local socket, no host
+    assert ":" not in runner.url.split("//", 1)[1].split("@", 1)[0]  # and no password
 
 
-def test_restore_refuses_corrupt_backup(data_dir: Path, tmp_path: Path) -> None:
-    bad = tmp_path / "bad.db"
-    bad.write_bytes(b"not sqlite at all" * 100)
-    with pytest.raises(backup.BackupError, match="integrity"):
-        backup.restore(bad, data_dir / "bridge.db", data_dir / "backups", data_dir)
-    with pytest.raises(backup.BackupError, match="not found"):
-        backup.resolve_backup("nope.db", data_dir / "backups")
+def test_dump_is_a_consistent_snapshot(
+    env: tuple[Settings, Database], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writes committed after the snapshot is exported are in neither the dump nor its
+    fingerprint, even though they land before the fingerprint and pg_dump run."""
+    settings, db = env
+    concurrent = "\\! psql -X -q --dbname=\"$PGDBURL\" -c 'DELETE FROM bridge.instruments'\n"
+    marker = "\\setenv PGSNAP :snap\n"
+    assert marker in pgtools.DUMP_PSQL
+    monkeypatch.setattr(
+        pgtools, "DUMP_PSQL", pgtools.DUMP_PSQL.replace(marker, marker + concurrent)
+    )
+    dump = backup.consistent_dump(
+        read_db_secrets_file(settings.db_secrets_file), settings.backups_dir, settings
+    )
+    assert count(db) == 0  # the delete really happened (another session, committed)
+    assert dump.fingerprint["tables"]["instruments"]["rows"] == 10
+    assert backup.verify_dump(dump, settings) == []  # ...and the dump holds the 10 rows
 
 
-def test_second_instance_cannot_start(data_dir: Path) -> None:
-    lock = backup.acquire_instance_lock(data_dir)
-    try:
-        with pytest.raises(backup.BackupError, match="another dhan_bridge instance"):
-            backup.acquire_instance_lock(data_dir)
-    finally:
-        lock.close()
+def test_verify_ok_and_detects_tampering(
+    env: tuple[Settings, Database], capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings, _ = env
+    assert run(["now"]) == 0
+    dump = latest(settings)
+    assert run(["verify", dump.name]) == 0
+    assert "OK:" in capsys.readouterr().out
+
+    # a sidecar that no longer describes the dump -> non-zero
+    sidecar = backup.sidecar_for(dump)
+    meta = json.loads(sidecar.read_text())
+    meta["fingerprint"]["tables"]["instruments"]["rows"] = 11
+    sidecar.write_text(json.dumps(meta))
+    assert run(["verify", dump.name]) == 1
+    assert "DIFF tables.instruments.rows: 11 != 10" in capsys.readouterr().out
+
+    # a modified dump file -> sha mismatch -> refused before restoring anything
+    with dump.open("ab") as handle:
+        handle.write(b"x")
+    assert run(["verify", dump.name]) == 2
+    assert "sha256 mismatch" in capsys.readouterr().err
+
+
+def test_restore_refuses_while_bridge_runs(
+    env: tuple[Settings, Database], capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings, _ = env
+    assert run(["now"]) == 0
+    assert run(["restore", latest(settings).name], host=FakeHost(running=True)) == 2
+    assert "is running" in capsys.readouterr().err
+
+
+def test_restore_replaces_schema_completely(env: tuple[Settings, Database]) -> None:
+    settings, db = env
+    assert run(["now"]) == 0
+    snapshot = latest(settings)
+    with db.begin() as conn:
+        conn.execute(text("DELETE FROM bridge.instruments WHERE security_id <> '2885'"))
+        conn.execute(text("CREATE TABLE bridge.added_later (x int)"))  # e.g. a newer revision
+    assert count(db) == 1
+
+    assert run(["restore", snapshot.name]) == 0
+    assert count(db) == 10
+    with db.connect() as conn:
+        tables = set(
+            conn.execute(
+                text("SELECT tablename FROM pg_tables WHERE schemaname='bridge'")
+            ).scalars()
+        )
+        aside = conn.execute(
+            text("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'bridge_pre_restore_%'")
+        ).scalar()
+    assert "added_later" not in tables  # nothing newer than the dump survives a restore
+    assert aside == 0
+    assert any(p.name.startswith("pre-restore-") for p in backup.list_dumps(settings.backups_dir))
+
+
+def test_failed_restore_puts_original_schema_back(
+    env: tuple[Settings, Database], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, db = env
+    assert run(["now"]) == 0
+    snapshot = latest(settings)
+    with db.begin() as conn:
+        conn.execute(text("DELETE FROM bridge.instruments WHERE security_id <> '2885'"))
+
+    def half_restore_then_fail(runner: PgRunner, dump_path: Path, pre_sql: str = "") -> None:
+        pgtools.psql(runner, pre_sql + " CREATE TABLE bridge.partial (x int);")
+        raise PgToolError("simulated pg_restore failure")
+
+    monkeypatch.setattr(backup, "restore", half_restore_then_fail)
+    dump = backup.load_dump(snapshot)
+    with pytest.raises(PgToolError):
+        backup.restore_into(own_runner(settings), dump, replace_existing=True)
+    assert count(db) == 1  # untouched current data is back in place
+    assert db.ok()
 
 
 def test_record_deploy_and_rollback_plan(
-    data_dir: Path, capsys: pytest.CaptureFixture[str]
+    env: tuple[Settings, Database], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert (
-        backup.main(["now", "--record-deploy", "--previous-tag", "0.0.9", "--target-tag", "0.1.0"])
-        == 0
-    )
-    record = json.loads((data_dir / "backups" / backup.LAST_DEPLOY).read_text())
+    settings, db = env
+    assert run(["now", "--record-deploy", "--previous-tag", "0.0.9", "--target-tag", "0.1.0"]) == 0
+    record = json.loads((settings.backups_dir / backup.LAST_DEPLOY).read_text())
     assert record["previous_tag"] == "0.0.9"
-    assert record["schema_version"] == 1
+    assert record["alembic_revision"] == db.head
     capsys.readouterr()
 
-    # schema unchanged -> plain redeploy of the previous tag
-    assert backup.main(["rollback-plan"]) == 0
+    assert run(["rollback-plan"]) == 0
     plan = dict(line.split("=", 1) for line in capsys.readouterr().out.split())
-    assert plan["PREVIOUS_TAG"] == "0.0.9"
     assert plan["NEEDS_RESTORE"] == "0"
+    assert plan["PREVIOUS_TAG"] == "0.0.9"
 
-    # the new release migrated -> restore needed
-    migrate(data_dir / "bridge.db", data_dir / "backups", "0.1.0", migrations=[V1, V2])
-    assert backup.main(["rollback-plan"]) == 0
+    # the new release migrated (simulated by moving the revision marker)
+    with db.begin() as conn:
+        conn.execute(text("UPDATE bridge.alembic_version SET version_num = '0099_future'"))
+    assert run(["rollback-plan"]) == 0
     plan = dict(line.split("=", 1) for line in capsys.readouterr().out.split())
     assert plan["NEEDS_RESTORE"] == "1"
-    assert plan["CURRENT_SCHEMA"] == "2"
-    assert plan["RECORDED_SCHEMA"] == "1"
-    assert (data_dir / "backups" / plan["BACKUP"]).is_file()
+    assert plan["CURRENT_REVISION"] == "0099_future"
+    assert (settings.backups_dir / plan["BACKUP"]).is_file()
 
 
-def test_rollback_plan_errors(data_dir: Path) -> None:
-    backups_dir = data_dir / "backups"
-    backups_dir.mkdir(exist_ok=True)
-    with pytest.raises(backup.BackupError, match="no deploy was recorded"):
-        backup.rollback_plan(data_dir / "bridge.db", backups_dir)
-    (backups_dir / backup.LAST_DEPLOY).write_text(
-        json.dumps({"previous_tag": "x; rm -rf /", "backup": "a.db", "schema_version": 1})
-    )
-    with pytest.raises(backup.BackupError, match="malformed"):
-        backup.rollback_plan(data_dir / "bridge.db", backups_dir)
-    (backups_dir / backup.LAST_DEPLOY).write_text(
-        json.dumps({"previous_tag": "0.0.9", "backup": "gone.db", "schema_version": 0})
-    )
-    with pytest.raises(backup.BackupError, match="missing"):
-        backup.rollback_plan(data_dir / "bridge.db", backups_dir)
-
-
-def test_record_deploy_validates_tags(tmp_path: Path) -> None:
-    with pytest.raises(backup.BackupError, match="invalid image tag"):
-        backup.record_deploy(
-            tmp_path, backup=tmp_path / "x.db", previous_tag="$(id)", target_tag="1", version=1
-        )
-
-
-def test_now_requires_tags_with_record_deploy(data_dir: Path) -> None:
-    with pytest.raises(SystemExit):
-        backup.main(["now", "--record-deploy"])
-
-
-def test_schema_version_of_missing_or_unmigrated(tmp_path: Path) -> None:
-    assert backup.schema_version(tmp_path / "missing.db") == 0
-    sqlite3.connect(tmp_path / "empty.db").close()
-    assert backup.schema_version(tmp_path / "empty.db") == 0
-
-
-def test_now_without_database_is_distinct_and_clears_stale_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_rollback_plan_errors(
+    env: tuple[Settings, Database], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    data = tmp_path / "data"
-    (data / "backups").mkdir(parents=True)
-    stale = data / "backups" / backup.LAST_DEPLOY
-    stale.write_text("{}")
-    monkeypatch.setenv("DATA_DIR", str(data))
-    args = ["now", "--record-deploy", "--previous-tag", "a", "--target-tag", "b"]
-    assert backup.main(args) == backup.EXIT_NO_DATABASE
-    assert not stale.exists()
+    settings, _ = env
+    settings.backups_dir.mkdir(parents=True, exist_ok=True)
+    assert run(["rollback-plan"]) == 2
+    assert "no deploy was recorded" in capsys.readouterr().err
+    (settings.backups_dir / backup.LAST_DEPLOY).write_text(
+        json.dumps({"previous_tag": "$(id)", "backup": "a.dump"})
+    )
+    assert run(["rollback-plan"]) == 2
+    assert "malformed" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        run(["now", "--record-deploy"])
+
+
+def test_prune_keeps_newest(
+    env: tuple[Settings, Database], capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings, _ = env
+    for _ in range(3):
+        assert run(["now"]) == 0
+    assert run(["prune", "--keep", "1"]) == 0
+    remaining = backup.list_dumps(settings.backups_dir)
+    assert len(remaining) == 1
+    assert [p.name for p in settings.backups_dir.glob("*.fingerprint.json")] == [
+        remaining[0].name + ".fingerprint.json"
+    ]
+    capsys.readouterr()
+    assert run(["latest"]) == 0
+    assert capsys.readouterr().out.strip().endswith(remaining[0].name)
+
+
+def test_restore_refuses_older_server(env: tuple[Settings, Database]) -> None:
+    settings, _ = env
+    assert run(["now"]) == 0
+    dump = backup.load_dump(latest(settings))
+    runner = own_runner(settings)
+    runner.major = 15  # pretend the target is older than the dump's source
+    with pytest.raises(backup.BackupError, match="older"):
+        backup.restore_into(runner, dump, replace_existing=True)
+
+
+def test_now_without_schema_exits_3(
+    make_settings: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_settings()  # fresh database, never migrated
+    export_ops_env(monkeypatch, settings)
+    assert run(["now"]) == backup.EXIT_NO_SCHEMA
+    assert not list(settings.backups_dir.glob("*.dump"))
+
+
+# --------------------------------------------------------------------------- off-site targets
+
+
+def test_load_targets(tmp_path: Path) -> None:
+    path = tmp_path / "targets.yaml"
+    assert backup.load_targets(path) == []  # no file: nothing configured
+    path.write_text(
+        "targets:\n"
+        "  - {name: nas, type: rsync, host: backup@nas, path: /srv/b/, ssh_key: /k}\n"
+        "  - {type: rclone, remote: 'b2:bucket/dhan'}\n"
+    )
+    assert backup.load_targets(path) == [
+        backup.Target("nas", "rsync", "backup@nas", "/srv/b/", "/k"),
+        backup.Target("target-1", "rclone", remote="b2:bucket/dhan"),
+    ]
+    path.write_text("targets:\n  - {type: ftp, host: x}\n")
+    with pytest.raises(backup.BackupError, match="unknown type"):
+        backup.load_targets(path)
+    path.write_text("targets:\n  - {type: rsync, host: x}\n")
+    with pytest.raises(backup.BackupError, match="needs host and path"):
+        backup.load_targets(path)
+
+
+def test_shipped_targets_config_is_an_all_commented_example() -> None:
+    from tests.conftest import REPO_ROOT
+
+    shipped = REPO_ROOT / "config" / "backup-targets.yaml"
+    assert shipped.is_file()
+    assert backup.load_targets(shipped) == []  # real targets are configured per host
+
+
+def test_offsite_copies_to_every_target_and_reports_failures(
+    env: tuple[Settings, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings, _ = env
+    assert run(["now"]) == 0
+    calls: list[list[str]] = []
+
+    class Proc:
+        def __init__(self, code: int) -> None:
+            self.returncode, self.stderr = code, "boom"
+
+    def fake_run(cmd: list[str], **kw: object) -> Proc:
+        calls.append(cmd)
+        return Proc(1 if cmd[0] == "rclone" else 0)
+
+    monkeypatch.setattr(backup.subprocess, "run", fake_run)
+    targets = tmp_path / "t.yaml"
+    targets.write_text(
+        "targets:\n"
+        "  - {name: nas, type: rsync, host: b@nas, path: /srv/b, ssh_key: /keys/id}\n"
+        "  - {name: cloud, type: rclone, remote: 'b2:x'}\n"
+    )
+    assert run(["offsite", latest(settings).name, "--targets", str(targets)]) == 1
+    assert "1/2 target(s) ok" in capsys.readouterr().out
+    rsync = calls[0]
+    assert rsync[0] == "rsync"
+    assert rsync[-1] == "b@nas:/srv/b/"
+    assert "-i /keys/id" in rsync[rsync.index("-e") + 1]
+    assert {Path(a).name for a in rsync if a.endswith(".dump")} == {latest(settings).name}
+    assert any(a.endswith(".fingerprint.json") for a in rsync)
+    assert calls[1][:2] == ["rclone", "copy"]
+
+    calls.clear()
+    assert run(["offsite", latest(settings).name, "--targets", str(tmp_path / "none.yaml")]) == 0
+    assert calls == []
+    assert "no off-site targets" in capsys.readouterr().out

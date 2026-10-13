@@ -1,7 +1,9 @@
 """Dhan scrip master cache and symbol resolution.
 
 The compact scrip master CSV is downloaded at most once per IST calendar day and
-cached in SQLite (equity and index rows only). Symbols are written
+cached in PostgreSQL (``bridge.instruments``; equity and index rows only). The
+cache is replaced in ONE transaction with a bulk ``COPY``; if a download fails
+the previous (stale) cache stays in use. Symbols are written
 ``EXCHANGE:TRADING_SYMBOL`` (e.g. ``NSE:RELIANCE``) and resolve to the
 ``(exchange_segment, security_id)`` pair the Dhan feed expects.
 """
@@ -11,13 +13,19 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import sqlite3
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
+
+from sqlalchemy import case, delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from dhan_bridge.db import Database
+from dhan_bridge.models import instruments, meta
 
 log = logging.getLogger(__name__)
 
@@ -99,7 +107,21 @@ def load_universe(path: Path) -> list[str]:
     return symbols
 
 
-def parse_scrip_master(text: str) -> Iterator[tuple[str, str, str, str, str, str, int, float, str]]:
+Row = tuple[str, str, str, str, str, str, int, Decimal, str]
+COPY_COLUMNS = (
+    "exchange",
+    "exchange_segment",
+    "security_id",
+    "trading_symbol",
+    "instrument",
+    "series",
+    "lot_size",
+    "tick_size",
+    "name",
+)
+
+
+def parse_scrip_master(text: str) -> Iterator[Row]:
     reader = csv.DictReader(io.StringIO(text))
     missing = [c for c in REQUIRED_COLUMNS if c not in (reader.fieldnames or [])]
     if missing:
@@ -117,7 +139,7 @@ def parse_scrip_master(text: str) -> Iterator[tuple[str, str, str, str, str, str
             (row.get(COL_INSTRUMENT) or "").strip().upper(),
             (row.get(COL_SERIES) or "").strip().upper(),
             _to_int(row.get(COL_LOT), 1),
-            _to_float(row.get(COL_TICK), 0.0),
+            _to_decimal(row.get(COL_TICK)),
             (row.get(COL_NAME) or "").strip(),
         )
 
@@ -129,53 +151,50 @@ def _to_int(value: str | None, default: int) -> int:
         return default
 
 
-def _to_float(value: str | None, default: float) -> float:
+def _to_decimal(value: str | None) -> Decimal:
     try:
-        return float(value) if value else default
-    except ValueError:
-        return default
+        return Decimal(value).quantize(Decimal("0.0001")) if value else Decimal(0)
+    except (InvalidOperation, ValueError):
+        return Decimal(0)
 
 
 class InstrumentStore:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            with conn:  # commit on success, roll back on error
-                yield conn
-        finally:
-            conn.close()
+    def __init__(self, db: Database) -> None:
+        self.db = db
 
     def cached_date(self) -> date | None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT value FROM meta WHERE key = ?", (META_KEY_DATE,)).fetchone()
-        return date.fromisoformat(row[0]) if row else None
+        with self.db.connect() as conn:
+            value = conn.execute(select(meta.c.value).where(meta.c.key == META_KEY_DATE)).scalar()
+        return date.fromisoformat(value) if value else None
 
     def count(self) -> int:
-        with self._connect() as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0])
+        with self.db.connect() as conn:
+            return int(conn.execute(select(func.count()).select_from(instruments)).scalar_one())
 
     def load_csv(self, text: str, as_of: date) -> int:
-        rows = list(parse_scrip_master(text))
-        if not rows:
+        """Replace the cache atomically: DELETE + COPY + meta update in one transaction."""
+        unique: dict[tuple[str, str], Row] = {}
+        for row in parse_scrip_master(text):
+            unique[(row[1], row[2])] = row  # (exchange_segment, security_id) is the key
+        if not unique:
             raise ValueError("scrip master contained no equity/index rows")
-        with self._connect() as conn:
-            conn.execute("DELETE FROM instruments")
-            conn.executemany(
-                "INSERT OR REPLACE INTO instruments (exchange, exchange_segment, security_id,"
-                " trading_symbol, instrument, series, lot_size, tick_size, name)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
+        with self.db.begin() as conn:
+            conn.execute(delete(instruments))
+            raw: Any = conn.connection.driver_connection
+            with raw.cursor() as cur:
+                columns = ", ".join(COPY_COLUMNS)
+                with cur.copy(f"COPY bridge.instruments ({columns}) FROM STDIN") as copy:
+                    for row in unique.values():
+                        copy.write_row(row)
+            stmt = pg_insert(meta).values(key=META_KEY_DATE, value=as_of.isoformat())
             conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                (META_KEY_DATE, as_of.isoformat()),
+                stmt.on_conflict_do_update(
+                    index_elements=[meta.c.key],
+                    set_={"value": stmt.excluded.value, "updated_at": func.now()},
+                )
             )
-        log.info("scrip master cached: %d rows as of %s", len(rows), as_of)
-        return len(rows)
+        log.info("scrip master cached: %d rows as of %s", len(unique), as_of)
+        return len(unique)
 
     def refresh_if_stale(self, today: date, fetch: Fetcher) -> bool:
         """Download once per day. Falls back to a stale cache if the download fails.
@@ -185,7 +204,7 @@ class InstrumentStore:
         if self.cached_date() == today and self.count() > 0:
             return False
         try:
-            self.load_csv(fetch(), today)
+            self.load_csv(fetch(), today)  # all-or-nothing: a failed load keeps the old cache
             return True
         except Exception as exc:
             if self.count() > 0:
@@ -198,34 +217,46 @@ class InstrumentStore:
     def resolve(self, symbol: str) -> Instrument | None:
         canonical = normalise_symbol(symbol)
         exchange, _, trading_symbol = canonical.partition(":")
+        cols = (
+            instruments.c.exchange_segment,
+            instruments.c.security_id,
+            instruments.c.lot_size,
+            instruments.c.tick_size,
+            instruments.c.name,
+        )
         if exchange == "IDX":
-            sql = (
-                "SELECT exchange_segment, security_id, lot_size, tick_size, name FROM instruments"
-                " WHERE exchange_segment = 'IDX_I' AND trading_symbol = ? LIMIT 1"
+            stmt = select(*cols).where(
+                instruments.c.exchange_segment == "IDX_I",
+                instruments.c.trading_symbol == trading_symbol,
             )
-            params: tuple[str, ...] = (trading_symbol,)
         else:
             # Prefer the regular EQ series when a symbol trades in several series.
-            sql = (
-                "SELECT exchange_segment, security_id, lot_size, tick_size, name FROM instruments"
-                " WHERE exchange = ? AND trading_symbol = ? AND instrument = 'EQUITY'"
-                " ORDER BY CASE series WHEN 'EQ' THEN 0 WHEN 'A' THEN 1 ELSE 2 END LIMIT 1"
+            rank = case(
+                (instruments.c.series == "EQ", 0), (instruments.c.series == "A", 1), else_=2
             )
-            params = (exchange, trading_symbol)
-        with self._connect() as conn:
-            row = conn.execute(sql, params).fetchone()
+            stmt = (
+                select(*cols)
+                .where(
+                    instruments.c.exchange == exchange,
+                    instruments.c.trading_symbol == trading_symbol,
+                    instruments.c.instrument == "EQUITY",
+                )
+                .order_by(rank, instruments.c.security_id)
+            )
+        with self.db.connect() as conn:
+            row = conn.execute(stmt.limit(1)).first()
         if row is None:
             return None
         return Instrument(canonical, row[0], str(row[1]), int(row[2]), float(row[3]), row[4])
 
     def reverse(self, exchange_segment: str, security_id: str) -> str | None:
         """(exchange_segment, security_id) -> canonical symbol."""
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT exchange, trading_symbol FROM instruments"
-                " WHERE exchange_segment = ? AND security_id = ?",
-                (exchange_segment, str(security_id)),
-            ).fetchone()
+        stmt = select(instruments.c.exchange, instruments.c.trading_symbol).where(
+            instruments.c.exchange_segment == exchange_segment,
+            instruments.c.security_id == str(security_id),
+        )
+        with self.db.connect() as conn:
+            row = conn.execute(stmt).first()
         if row is None:
             return None
         exchange = "IDX" if exchange_segment == "IDX_I" else row[0]

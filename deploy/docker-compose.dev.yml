@@ -1,0 +1,53 @@
+# Local development: the same PostgreSQL 16 service as production (same pinned image,
+# same postgresql.conf, schema "bridge" created by Alembic on first start), but
+# published on loopback so the app can run on the host.
+#
+#   docker compose -f deploy/docker-compose.dev.yml up -d postgres      (or: make dev-db)
+#   printf 'DATABASE_URL=postgresql://bridge:bridge-dev@127.0.0.1:5432/bridge?sslmode=disable\n' > secrets/db.env
+#   make run                     # app on the host against this database
+#
+# Optional: run the app in a container too (profile "app"):
+#   docker compose -f deploy/docker-compose.dev.yml --profile app up --build
+# with secrets/db.env pointing at host "postgres" instead of 127.0.0.1.
+name: dhan_bridge_dev
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: ${DEV_PG_PASSWORD:-bridge-dev}   # local only, bound to loopback
+      POSTGRES_DB: bridge
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U bridge -d bridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    shm_size: 128mb
+    mem_limit: ${PG_MEM_LIMIT:-1g}
+    cpus: ${PG_CPUS:-1.0}
+
+  bridge:
+    profiles: ["app"]
+    build: ..
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      BRIDGE_MODE: replay
+      DB_SSLMODE: disable
+      ALLOWED_ORIGINS: http://localhost:5173
+    volumes:
+      - ../secrets:/run/secrets:ro
+      - ../data:/app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  pgdata:

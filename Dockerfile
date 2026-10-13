@@ -26,6 +26,7 @@ ENV PATH=/opt/venv/bin:$PATH \
     UNIVERSE_FILE=/app/universe/nifty50.txt \
     HOLIDAYS_DIR=/app/holidays \
     SECRETS_FILE=/run/secrets/dhan.env \
+    DB_SECRETS_FILE=/run/secrets/db.env \
     ADMIN_KEY_FILE=/run/secrets/admin.key
 
 # The runtime needs no packaging tools: drop them (and their vendored, CVE-prone deps).
@@ -38,7 +39,10 @@ COPY --from=build /opt/venv /opt/venv
 COPY dhan_bridge/ /app/dhan_bridge/
 COPY universe/ /app/universe/
 COPY holidays/ /app/holidays/
-RUN mkdir -p /app/data/backups && chown -R bridge:bridge /app/data
+# Lock for the HOST-side ops venv (scripts/ops.sh extracts it with the code, so the
+# host tools always match the deployed release). Not installed in this image.
+COPY requirements-ops.txt /app/ops/requirements-ops.txt
+RUN mkdir -p /app/data && chown -R bridge:bridge /app/data
 
 USER bridge
 EXPOSE 8000

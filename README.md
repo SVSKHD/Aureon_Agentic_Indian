@@ -4,12 +4,13 @@
 
 > **It never places real orders.** See [Safety](#safety).
 
-Release **0.1.0** is the foundation: configuration, secrets handling with hot token rotation, the market calendar, the instrument master, SQLite migrations, health checks, production packaging and the Jenkins pipeline. Later releases add the live feed, candles, screeners, alerts and paper trading.
+Release **0.1.0** is the foundation: configuration, secrets handling with hot token rotation, the market calendar, the instrument master, PostgreSQL 16 storage in the compose stack (portable to any Postgres host), backup verification and host-migration tooling, health checks, production packaging and the Jenkins pipeline. Later releases add the live feed, candles, screeners, alerts and paper trading.
 
 | | |
 |---|---|
 | Universe | NIFTY 50 (`universe/nifty50.txt`) |
-| Runtime | Python 3.11, FastAPI, uvicorn (**1 worker**), asyncio, SQLite |
+| Runtime | Python 3.11, FastAPI, uvicorn (**1 worker**), asyncio |
+| Database | PostgreSQL 16 (compose service, internal network) via SQLAlchemy 2 + psycopg 3 + Alembic; schema `bridge` |
 | Dhan SDK | `dhanhq==2.3.0` (`DhanContext` API), wrapped in `dhan_bridge/dhan_client.py` |
 | Production | single Linux VPS, Docker Compose, deployed over SSH by Jenkins |
 
@@ -19,17 +20,25 @@ Release **0.1.0** is the foundation: configuration, secrets handling with hot to
 dhan_bridge/
   config.py        settings (pydantic-settings), secrets file parsing, masking, SecretsStore
   calendar.py      IST helpers, market hours, NSE holidays, deploy guard CLI
-  instruments.py   scrip master download + SQLite cache, symbol <-> security id
+  db.py            engine/pool, Alembic integration, outage-tolerant Database, retry
+  models.py        table definitions (schema "bridge"), the source of truth for dbverify
+  migrations/      Alembic env + versions/ (revisions 0001..)
+  instruments.py   scrip master download + Postgres cache (bulk COPY), symbol <-> security id
   dhan_client.py   thin read-only wrapper over dhanhq
   health.py        token monitor, /health payload, probe CLI
-  keys.py          API keys (sha256-hashed in SQLite) + CLI
+  keys.py          API keys (sha256-hashed) + CLI
   auth.py          bearer-key dependency for /api, WebSocket auth helper
-  backup.py        online backup / verify / restore, deploy record, instance lock
+  lock.py          single-instance lock
   api.py           FastAPI app (create_app factory)
-  migrations/      versioned *.sql migrations + runner (with backups)
-tests/             pytest suite (no network)
-deploy/            compose files (prod, staging), nginx.conf, remote-deploy.sh,
-                   backup-offsite.sh, systemd/ (nightly off-site backup timer)
+  dbverify.py      database fingerprints (row counts, money sums, time ranges) + compare
+  cors.py          exact-origin CORS for /api, Origin check for WebSockets
+  pgtools.py       psql/pg_dump/pg_restore in postgres containers (host side, no pg tools needed)
+  backup.py        consistent dump / verify / restore / off-site copy / rollback plan (host side)
+  dbmove.py        move schema "bridge" to another Postgres host (host side)
+tests/             pytest suite against real throwaway PostgreSQL (no network)
+deploy/            compose files (prod, staging, dev), postgresql.conf, nginx.conf, remote-deploy.sh
+scripts/           ops.sh (host DB tools), backup-nightly.sh, db-move.sh
+config/            backup-targets.yaml (commented example of off-site targets)
 universe/          symbol lists
 holidays/          NSE holiday calendars (one JSON per year)
 ci/                CI helper scripts
@@ -52,25 +61,25 @@ EOF
 openssl rand -hex 32 > secrets/admin.key
 chmod 600 secrets/*
 
-# Non-secret settings go in .env (gitignored):
-cat > .env <<'EOF'
-BRIDGE_MODE=replay
-SECRETS_FILE=./secrets/dhan.env
-ADMIN_KEY_FILE=./secrets/admin.key
-EOF
+# Local PostgreSQL 16: the production postgres service, published on loopback:
+make dev-db
+printf 'DATABASE_URL=postgresql://bridge:bridge-dev@127.0.0.1:5432/bridge?sslmode=disable\n' > secrets/db.env
 
-make run            # uvicorn on :8000 (replay mode)
+# Non-secret settings go in .env (gitignored):
+cp .env.example .env
+
+make run            # uvicorn on :8000 (replay mode); migrates the dev database on start
 curl localhost:8000/health                       # loopback: full payload
 .venv/bin/python -m dhan_bridge.keys create dev  # prints a key once
 curl -H "Authorization: Bearer dbk_..." localhost:8000/api/universe
 ```
 
-`make check` runs everything CI runs before the image build: ruff, ruff format, mypy (strict on `calendar.py` and `config.py`) and pytest.
+`make check` runs everything CI runs before the image build: ruff, ruff format, mypy (strict on `calendar.py` and `config.py`) and pytest. The tests need Docker and run against **real PostgreSQL only** (no SQLite fallback): they start throwaway `postgres:<major>-alpine` containers (16, plus 15 and 17 for the host-move tests), reach "our" database with `docker exec` like production, and other servers through `docker run --network host` tools containers. Set `PG_TEST_IMAGE` to pull from a mirror, for example `mirror.gcr.io/library/postgres:{major}-alpine`.
 
 ### Modes
 
-* `BRIDGE_MODE=live`: needs the secrets file. Downloads the scrip master (at most once per IST day), resolves the universe and **fails at startup if any symbol is unknown**. It verifies the token at startup and then hourly.
-* `BRIDGE_MODE=replay`: never contacts Dhan. Secrets are optional. The universe is resolved only if a cached scrip master already exists. `token_ok` is `null`. Replay data arrives in a later release.
+* `BRIDGE_MODE=live`: needs `dhan.env` and `db.env`, and **fails fast at startup if the database is unreachable**. Downloads the scrip master (at most once per IST day), resolves the universe and **fails at startup if any symbol is unknown**. It verifies the token at startup and then hourly.
+* `BRIDGE_MODE=replay`: never contacts Dhan. `dhan.env` is optional. `db.env` is required, but an unreachable database doesn't stop startup: `db_ok` stays `false` and the app keeps retrying in the background. The universe is resolved only if a cached scrip master already exists. `token_ok` is `null`. Replay data arrives in a later release.
 
 ### Settings (`.env` / environment)
 
@@ -81,7 +90,12 @@ curl -H "Authorization: Bearer dbk_..." localhost:8000/api/universe
 | `PAPER_CAPITAL` | `1000000` | INR |
 | `SECRETS_FILE` | `/run/secrets/dhan.env` | the only source of Dhan credentials |
 | `ADMIN_KEY_FILE` | `/run/secrets/admin.key` | for `POST /admin/reload-token` |
-| `DATA_DIR` | `data/` | SQLite db + `backups/` |
+| `DB_SECRETS_FILE` | `/run/secrets/db.env` | the only source of `DATABASE_URL` (hot-reloaded) |
+| `DB_SSLMODE` | `prefer` | applied when `DATABASE_URL` has no `sslmode`. On hosts, set it in `bridge.env` (the container and `ops.sh` both read it), never as a compose `environment:` entry, which would override `bridge.env`. |
+| `ALLOWED_ORIGINS` | (empty) | comma-separated **exact** browser origins (`https://app.example.org,http://localhost:5173`) for `/api` CORS and the WebSocket Origin check. No paths, no wildcards; `*` is refused in live mode. |
+| `BACKUP_KEEP` | `7` | local dumps kept by `backup prune` / the nightly job (ops tools) |
+| `BACKUP_TARGETS_FILE` | `config/backup-targets.yaml` | off-site targets (ops tools) |
+| `DATA_DIR` | `data/` | `backups/`, `migrations-log/`, `bridge.lock` |
 | `HOLIDAYS_DIR` | `holidays/` | |
 | `TOKEN_CHECK_INTERVAL_S` | `3600` | |
 | `SECRETS_POLL_INTERVAL_S` | `5` | file-watch interval |
@@ -95,6 +109,88 @@ python -m dhan_bridge.calendar deploy-guard --at 2026-10-13T10:00
 ```
 
 Deploys are blocked from 09:00 to 15:45 IST on trading days. The holiday file `holidays/nse_<year>.json` must be added each December from NSE's circular. A year without a file treats every weekday as a trading day, so the guard fails safe.
+
+## Database
+
+PostgreSQL 16 is the only store, and it runs **in our own compose stack** (service `postgres`). **Python is the only process that talks to the database**: no other service, SDK or API layer connects to it. The data can move to any other PostgreSQL host later without a code change (see [Moving to another host](#moving-to-another-host)).
+
+### Architecture
+
+```
+            compose network "default"                 compose network "db" (internal: true)
+ nginx ──────────────► bridge (FastAPI, 1 worker) ─────────────► postgres:16-alpine (pinned by digest)
+                         │  DATABASE_URL from /run/secrets/db.env          │  no published port
+                         │  pool 3 + 2, search_path = bridge                │  volume pgdata
+                         ▼                                                  │  deploy/postgresql.conf
+                     Dhan APIs                    host: scripts/ops.sh ─────┘  (docker compose exec -T postgres ...)
+```
+
+* **Driver:** SQLAlchemy 2 + psycopg 3, with a small pool (3 + 2 overflow, pre-ping, 10 s connect timeout). `sslmode` comes from `DB_SSLMODE` (default `prefer`) unless the URL sets it; use `verify-full` for a remote host with a proper certificate.
+* **Connection URL:** `DATABASE_URL` comes **only** from `/run/secrets/db.env`. Rewriting that file swaps the connection pool without a restart, the same way `dhan.env` rotation works. Passwords are masked in every log, repr and migration log.
+* **Compose service:** `postgres:16-alpine` pinned by digest; named volume `pgdata`; **no published port**, attached only to the internal network `db` (the bridge is on both networks). The superuser password comes from `secrets/postgres_password` (`POSTGRES_PASSWORD_FILE`); `db.env` holds the same password. A `pg_isready` healthcheck gates the bridge (`depends_on: service_healthy`). `deploy/postgresql.conf` is mounted read-only: `shared_buffers=256MB`, `max_connections=30`, UTC. Memory and CPU limits are compose variables with defaults: `PG_MEM_LIMIT=1g`, `PG_CPUS=1.0`, `BRIDGE_MEM_LIMIT=512m`, `BRIDGE_CPUS=1.0` (override in `.env`).
+* **Schema:** every table lives in schema **`bridge`**; nothing is created in `public`, and `REVOKE ALL ON SCHEMA bridge FROM PUBLIC` keeps other roles out. `search_path` is set to `bridge` on every connection. Tests check that every table is in `bridge` and that no module imports `sqlite3`.
+* **Types:** only standard Postgres types. Money is `NUMERIC(18,4)`; timestamps are `TIMESTAMPTZ`, stored as UTC and shown as IST. No extensions (the allowlist is empty) and no vendor-specific schemas, checked by `tests/test_portability.py`.
+* **Instrument cache:** the scrip master is loaded with `COPY` in one transaction; if a refresh fails, the last good cache stays in use.
+* **Health:** `db_ok` means `SELECT 1` answered within 3 s **and** `alembic current == head`.
+* **Live startup fails fast** if the database is unreachable. **Outages after startup** don't crash the app: `/health` reports `db_ok: false`, `/api` answers 503 (not 401), and background writes (the scrip master refresh) are logged and retried with exponential backoff.
+* **No pg tools in the bridge image, none needed on the host.** The host-side ops tools (`scripts/ops.sh`, which runs `dhan_bridge.backup` / `dhan_bridge.dbmove` from the deployed image's code in a hash-locked venv) never open a database connection. Every database step runs `psql` / `pg_dump` / `pg_restore` inside a container:
+  * **our database** (the `DATABASE_URL` host is `postgres`): `docker compose exec -T postgres ...`, over the container's local socket, so no password is passed;
+  * **any other host**: `docker run --rm -i postgres:<major>-alpine ...`, where `<major>` is the server's own major, so the client is never older than the server. The URL goes in via the container environment, never on a command line.
+
+### Backups and nightly verification
+
+`python -m dhan_bridge.backup` (on a host: `bash ops.sh backup ...`):
+
+| Command | What it does |
+|---|---|
+| `now` | Consistent snapshot: one psql session opens a REPEATABLE READ, READ ONLY transaction, exports its snapshot (`pg_export_snapshot()`), takes the [fingerprint](#fingerprints) **in that transaction**, and runs `pg_dump -Fc --schema=bridge --snapshot=<id>` while it stays open. Writes `data/backups/bridge-<ts>.dump` and `bridge-<ts>.dump.fingerprint.json` (fingerprint, sha256, source host without password). |
+| `verify <file>` | Checks the sha256, restores the dump into a **throwaway** plain `postgres:<major>-alpine` container, fingerprints it and compares with the sidecar. Any difference exits non-zero. |
+| `restore <file> [--force]` | Refuses while the bridge container runs unless `--force`. Takes a safety dump (`pre-restore-*.dump`), renames the current schema aside, runs `pg_restore --clean --if-exists --schema=bridge` into a fresh `bridge` schema and compares fingerprints. On success the renamed copy is dropped; on any failure the original schema is put back. |
+| `offsite <file>` | Copies the dump, its sidecar and `last-deploy.json` to **every** target in `config/backup-targets.yaml` (rsync over SSH with a host/path/key, or an rclone `remote:path`). Any failed target exits non-zero. |
+| `prune [--keep N]` | Keeps the newest N dumps (default `BACKUP_KEEP=7`). |
+| `rollback-plan`, `latest` | Used by `remote-deploy.sh`. |
+
+The schema is renamed aside instead of relying on `--clean` alone because a `--schema` restore skips `CREATE SCHEMA`, and tables created after the dump (by a newer release) would otherwise survive the restore.
+
+**Nightly:** `scripts/backup-nightly.sh` runs `now` → `verify` → `offsite` → `prune` (keep 7). Any failure exits non-zero and, if `secrets/discord.env` contains `DISCORD_WEBHOOK_URL=...`, posts the failed step to Discord. Scheduling it (timer or cron) and real off-site targets are part of each host's deployment wiring; `config/backup-targets.yaml` ships as a fully commented example:
+
+```yaml
+targets:
+  - {name: nas,   type: rsync,  host: backup@nas.example.internal, path: /srv/backups/dhan_bridge/, ssh_key: /home/deploy/.ssh/backup_ed25519}
+  - {name: cloud, type: rclone, remote: b2-backups:dhan-bridge/postgres}
+```
+
+**Every deploy:** `remote-deploy.sh deploy` runs `backup now --record-deploy` **before pulling** and writes `data/backups/last-deploy.json` = `{previous_tag, target_tag, alembic_revision, backup}`. `rollback` restores that dump when the Alembic revision moved.
+
+### Fingerprints
+
+`dhan_bridge.dbverify` builds one SQL statement from the catalog and the model metadata. It records:
+
+* the Alembic revision and the server major version;
+* the exact row count of **every** table in `bridge` (from the catalog, so unknown tables show up too);
+* the sum of every `NUMERIC` column (exact, as text) and the min/max of every `TIMESTAMPTZ` column (formatted in UTC by the server). These columns are discovered from `models.py`, so new tables are covered automatically.
+
+The app computes it through SQLAlchemy (`fingerprint(conn)`), the ops tools through `psql` in a container (`\gexec`); a test asserts both give identical JSON. `compare(a, b)` lists every difference; an empty list means identical. `python -m dhan_bridge.dbverify compare a.json b.json` compares two fingerprint files (or backup sidecars).
+
+### Moving to another host
+
+The target can be any PostgreSQL server whose major version is >= ours (another VPS, a managed service). Only `db.env` changes.
+
+```bash
+cd /opt/dhan_bridge
+# db.env for the new host, readable by group bridge
+sudo install -m 0440 -g 10001 /dev/stdin /tmp/target-db.env <<< 'DATABASE_URL=postgresql://user:pass@new-host:5432/db?sslmode=verify-full'
+bash db-move.sh --target-secrets /tmp/target-db.env --dry-run   # full copy + verify, then removes the copy
+bash db-move.sh --target-secrets /tmp/target-db.env             # the real move (outside market hours)
+bash db-move.sh --revert                                        # fallback window: back to the old host
+```
+
+1. **Preflight** (nothing changes if it fails): the market-hours guard (`--force-market-hours --reason "..."` to override); target reachable; target major >= source major; target schema `bridge` absent or empty (otherwise `--overwrite-target`); enough local disk for the dump; source and target are not the same database.
+2. **Copy:** stop the bridge (not in `--dry-run`, which copies a live snapshot and never stops anything), take a consistent dump, `pg_restore` it into the target.
+3. **Verify:** the target's fingerprint must equal the dump's (except `server_major`), and its Alembic revision must be head. On a mismatch, the bad copy is removed, the bridge restarts on the untouched source and the tool exits 1.
+4. **Switch:** `db.env` → `db.env.previous`, the target's `db.env` is moved into place atomically (owner, group and mode preserved), the bridge starts and must pass the strict health gate within 120 s. If it doesn't, `db.env.previous` goes back, the bridge restarts on the source and the tool exits 1.
+
+Exit codes: 0 moved (or dry run passed), 1 failed but the source is back and healthy, 2 preflight refused (nothing changed), 3 manual action required. Every run writes `data/migrations-log/<ts>.json` (hosts without passwords, versions, both fingerprints, steps, result). **The source database is only ever read.** The compose `postgres` service keeps running after a move, which is what makes `--revert` possible; keep it for two weeks, then retire it (see the runbook). `--revert` warns that writes made on the new host are **not** copied back.
 
 ## API authentication
 
@@ -151,15 +247,20 @@ Secrets are handled with the same care:
 
 ## Migrations
 
-Migrations live in `dhan_bridge/migrations/NNNN_name.sql` and are applied at startup, after a backup. They must be **expand-only**: never `DROP` or `RENAME` a table or column that the previous release still uses. Add new tables and nullable or defaulted columns, and stop using old ones. Remove them in a later release, once no deployable version reads them.
+Alembic revisions live in `dhan_bridge/migrations/versions/NNNN_name.py`. The app runs `alembic upgrade head` at startup, after the deploy took a pre-deploy dump. CLI inside the image: `python -m dhan_bridge.db upgrade | current | heads`.
 
-This is what keeps rollback cheap. The previous release keeps working against the newer schema. `remote-deploy.sh rollback` still restores the pre-deploy backup whenever the schema version changed, so data written by the new release in its first minutes is discarded on rollback.
+Rules, enforced by tests:
 
-`tests/test_migrations.py` fails on any `DROP` or `RENAME` in a migration file that lacks a line like:
+* **Expand-only.** Never drop or rename a table or column that the previous release still uses. Add new tables and nullable or defaulted columns, and stop using old ones. Remove them in a later release, once no deployable version reads them. `tests/test_db_schema.py` fails on `op.drop_*`, `op.rename_table`, `alter_column(new_column_name=...)` or raw `DROP`/`RENAME` in `upgrade()` unless the file has a line like:
+  ```python
+  # -- allow-destructive: table unused since 0.3.0 (last reader removed in 0.2.0)
+  ```
+* **Schema.** Everything goes in schema `bridge` (`schema="bridge"` on every table and index); nothing in `public`.
+* **Portability.** Only standard types, money as `NUMERIC(18,4)`, `TIMESTAMPTZ` only, no extensions, and no references to vendor-specific schemas (`auth`, `storage`, `cron`, `rdsadmin`, ...) or to `public`. This is checked by `tests/test_portability.py`.
+* **Models and revisions agree.** `dhan_bridge/models.py` and the revisions must match: Alembic autogenerate against a migrated database must find nothing to do.
+* **No downgrades.** Downgrades are not implemented. Rolling back means restoring the pre-deploy dump (`remote-deploy.sh rollback` does this when the revision moved).
 
-```sql
--- allow-destructive: table unused since 0.3.0 (last reader removed in 0.2.0)
-```
+Expand-only is what keeps rollback cheap: the previous release keeps working against the newer schema. `rollback` still restores the pre-deploy dump whenever the Alembic revision changed, so data written by the new release in its first minutes is discarded on rollback.
 
 ## Deployment
 
@@ -171,7 +272,10 @@ apt-get install -y docker.io docker-compose-plugin curl
 useradd -m -G docker deploy                       # Jenkins logs in as this user
 install -d -o deploy -g deploy /opt/dhan_bridge
 cd /opt/dhan_bridge
-install -d -o 10001 -g 10001 -m 700 data secrets  # uid 10001 = 'bridge' user in the image
+apt-get install -y python3 python3-venv rsync       # host-side ops tools (ops.sh) + off-site copy; no pg client needed
+groupadd -g 10001 bridge && usermod -aG bridge deploy  # gid 10001 = the image's 'bridge' group
+install -d -o deploy -g bridge -m 2770 data            # backups/, migrations-log/, bridge.lock
+install -d -o deploy -g bridge -m 2750 secrets         # files 0440: readable by the app (gid 10001) and deploy
 install -d -m 755 certs                           # fullchain.pem + privkey.pem (e.g. certbot)
 
 cat > .env <<'EOF'                                # compose variables (Jenkins rewrites BRIDGE_TAG)
@@ -180,7 +284,14 @@ BRIDGE_TAG=0.1.0
 EOF
 cat > bridge.env <<'EOF'                          # non-secret app settings
 PAPER_CAPITAL=1000000
+ALLOWED_ORIGINS=https://app.example.org
 EOF
+# database password: one random value in both secrets files
+pw="$(openssl rand -hex 24)"
+install -o 70 -g 70 -m 0400 /dev/stdin secrets/postgres_password <<< "$pw"
+install -o deploy -g bridge -m 0440 /dev/stdin secrets/db.env <<< "DATABASE_URL=postgresql://bridge:${pw}@postgres:5432/bridge"
+unset pw
+install -d -o deploy -g deploy config                # optional: config/backup-targets.yaml (see Database)
 # staging only: BRIDGE_MODE=replay is the compose default; set BRIDGE_MODE=live in .env to override.
 
 # registry pull credentials live on the host (Jenkins never sends them)
@@ -191,7 +302,9 @@ Add the host's SSH key to the Jenkins agent's `known_hosts`. The pipeline uses `
 
 ### Secrets file format
 
-`/opt/dhan_bridge/secrets/dhan.env`, owned by uid 10001, mode `0400`:
+All secrets files are owned by `deploy:bridge` (gid 10001) with mode `0440`. The container (uid/gid 10001) can read them through the group, and so can the host DB tools that run as `deploy`.
+
+`/opt/dhan_bridge/secrets/dhan.env`:
 
 ```
 # Dhan API credentials. KEY=VALUE, '#' comments allowed.
@@ -199,7 +312,17 @@ DHAN_CLIENT_ID=1100xxxxxx
 DHAN_ACCESS_TOKEN=eyJ...
 ```
 
-`/opt/dhan_bridge/secrets/admin.key` holds one line, a random string (`openssl rand -hex 32`), owned by uid 10001, mode `0400`.
+`/opt/dhan_bridge/secrets/db.env` (see [Database](#database)); the host is the compose service `postgres`:
+
+```
+DATABASE_URL=postgresql://bridge:<password>@postgres:5432/bridge
+```
+
+`/opt/dhan_bridge/secrets/postgres_password` holds the same password on one line. The postgres image reads it as its own user (uid 70), so this one file is owned `70:70` with mode `0400`. The password only takes effect when the `pgdata` volume is first initialised; to change it later, run `ALTER ROLE bridge PASSWORD '...'` via `docker compose exec postgres psql -U bridge`, then update both files.
+
+`/opt/dhan_bridge/secrets/admin.key` holds one line, a random string (`openssl rand -hex 32`).
+
+`/opt/dhan_bridge/secrets/discord.env` (optional, for the nightly backup alert): `DISCORD_WEBHOOK_URL=...`.
 
 The whole `secrets/` directory is mounted read-only at `/run/secrets`, so the app sees `/run/secrets/dhan.env`. The bridge mounts the directory rather than the single file. Docker pins a single-file bind mount to the old inode, so an atomic replace on the host would never become visible to the app.
 
@@ -209,7 +332,7 @@ The whole `secrets/` directory is mounted read-only at `/run/secrets`, so the ap
 cd /opt/dhan_bridge/secrets
 umask 077
 printf 'DHAN_CLIENT_ID=%s\nDHAN_ACCESS_TOKEN=%s\n' "$CLIENT_ID" "$NEW_TOKEN" > dhan.env.new
-chown 10001:10001 dhan.env.new && chmod 400 dhan.env.new
+chgrp bridge dhan.env.new && chmod 440 dhan.env.new
 mv dhan.env.new dhan.env           # atomic: the app never sees a half-written file
 ```
 
@@ -225,36 +348,7 @@ curl -fsS -X POST -H "X-Admin-Key: $(sudo cat /opt/dhan_bridge/secrets/admin.key
 
 ### Backups
 
-* **On every app start with pending migrations:** `data/backups/<version>-<ts>.db`.
-* **On every deploy:** `remote-deploy.sh deploy` takes an online backup of the *running* release before pulling anything. It records `{previous_tag, target_tag, schema_version, backup}` in `data/backups/last-deploy.json`, and `rollback` relies on that record.
-* **By hand:**
-  ```bash
-  docker exec dhan_bridge python -m dhan_bridge.backup now
-  docker exec dhan_bridge python -m dhan_bridge.backup verify <file>
-  ```
-  `restore` is covered in [docs/RUNBOOK.md](docs/RUNBOOK.md#4-restore-sqlite-from-a-backup). It refuses while the app is running unless you pass `--force`.
-
-The newest 30 backups are kept. The app holds an exclusive lock on `data/bridge.lock`, so a second instance on the same data directory refuses to start.
-
-### Off-site backups
-
-`deploy/backup-offsite.sh` runs nightly from a systemd timer at 23:30 IST. It takes a fresh online backup, checks the newest backup with `PRAGMA integrity_check` (when `sqlite3` is installed), and copies it, together with `last-deploy.json`, off the host.
-
-```bash
-# as root on the VPS (Jenkins keeps /opt/dhan_bridge/backup-offsite.sh up to date)
-install -d -m 700 /etc/dhan_bridge
-cat > /etc/dhan_bridge/offsite.env <<'EOF'
-OFFSITE_METHOD=rsync                                   # or: rclone
-OFFSITE_TARGET=backup@vault.example.com:/srv/backups/dhan_bridge
-OFFSITE_SSH_KEY=/etc/dhan_bridge/offsite_ed25519       # rsync only; add the vault to root's known_hosts
-# OFFSITE_TARGET=b2:my-bucket/dhan_bridge              # rclone: configure the remote with `rclone config`
-EOF
-cp deploy/systemd/dhan-bridge-offsite-backup.{service,timer} /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now dhan-bridge-offsite-backup.timer
-systemctl start dhan-bridge-offsite-backup.service && journalctl -u dhan-bridge-offsite-backup -n 20
-```
-
-Retention on the target is up to you, for example a lifecycle rule on the bucket or a `find -mtime +90 -delete` on the vault.
+See [Backups and nightly verification](#backups-and-nightly-verification). The app holds an exclusive lock on `data/bridge.lock`, so a second instance on the same host refuses to start.
 
 ### What Jenkins does
 
@@ -279,7 +373,7 @@ bash remote-deploy.sh rollback          # uses data/backups/last-deploy.json
 bash remote-deploy.sh health 120 --strict
 ```
 
-`rollback` compares the current schema version with the one recorded before the deploy. If they differ, it stops the bridge, restores the pre-deploy backup and then starts the previous tag. If they match, it just redeploys the previous tag. Jenkins copies `remote-deploy.sh` to `/opt/dhan_bridge/` on every deploy. To go back further than one release, see [docs/RUNBOOK.md](docs/RUNBOOK.md#6-prod-deploy-failed-and-auto-rollback-ran).
+`rollback` compares the current Alembic revision with the one recorded before the deploy. If they differ, it stops the bridge, restores the pre-deploy backup and then starts the previous tag. If they match, it just redeploys the previous tag. Jenkins copies `remote-deploy.sh` to `/opt/dhan_bridge/` on every deploy. To go back further than one release, see [docs/RUNBOOK.md](docs/RUNBOOK.md#6-prod-deploy-failed-and-auto-rollback-ran).
 
 ## Releasing
 
@@ -289,4 +383,4 @@ bash remote-deploy.sh health 120 --strict
 
 ## Dependencies
 
-`requirements.in` / `requirements-dev.in` are the sources. The lock files are generated with `make lock`, which runs `pip-compile --generate-hashes`. Installs always use `--require-hashes`.
+`requirements.in`, `requirements-dev.in` and `requirements-ops.in` (the host-side DB tools venv) are the sources. The lock files are generated with `make lock`, which runs `pip-compile --generate-hashes`. Installs always use `--require-hashes`.
