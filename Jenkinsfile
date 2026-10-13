@@ -261,11 +261,11 @@ pipeline {
                             }
                             trap cleanup EXIT
                             docker network create "$net" >/dev/null
-                            POSTGRES_PASSWORD="$pgpass" docker run -d --name "$pg" --network "$net" \
+                            POSTGRES_PASSWORD="$pgpass" docker run -d --name "$pg" --network "$net" \\
                                 -e POSTGRES_PASSWORD "$(echo "$PG_TEST_IMAGE" | sed 's/{major}/16/')" >/dev/null
                             mkdir -p .smoke/secrets
-                            printf 'DHAN_CLIENT_ID=0000000000\nDHAN_ACCESS_TOKEN=smoke-test-not-a-real-token\n' > .smoke/secrets/dhan.env
-                            printf 'DATABASE_URL=postgresql://postgres:%s@%s:5432/postgres?sslmode=disable\n' "$pgpass" "$pg" > .smoke/secrets/db.env
+                            printf 'DHAN_CLIENT_ID=0000000000\\nDHAN_ACCESS_TOKEN=smoke-test-not-a-real-token\\n' > .smoke/secrets/dhan.env
+                            printf 'DATABASE_URL=postgresql://postgres:%s@%s:5432/postgres?sslmode=disable\\n' "$pgpass" "$pg" > .smoke/secrets/db.env
                             for i in $(seq 1 30); do docker exec "$pg" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
                             docker create --name "$name" --network "$net" -e BRIDGE_MODE=replay "$IMAGE:$GIT_SHA" >/dev/null
                             # docker cp (not a bind mount) works even when the agent itself runs in a container.
@@ -274,7 +274,7 @@ pipeline {
                             for i in $(seq 1 30); do
                                 # docker exec => loopback peer => full /health payload; --strict needs
                                 # db_ok (SELECT 1 + alembic at head) and token_ok == null in replay
-                                if docker exec "$name" python -m dhan_bridge.health probe --strict \
+                                if docker exec "$name" python -m dhan_bridge.health probe --strict \\
                                        --expect-mode replay --expect-version "$VERSION"; then
                                     exit 0
                                 fi
