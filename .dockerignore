@@ -1,0 +1,15 @@
+# Allow-list: only what the image needs.
+*
+!requirements.txt
+!dhan_bridge/
+!universe/
+!holidays/
+
+# Never ship secrets, state or caches, even if they end up under an allowed dir.
+**/.env
+**/*.env
+**/secrets/
+**/*.key
+**/data/
+**/__pycache__/
+**/*.pyc
