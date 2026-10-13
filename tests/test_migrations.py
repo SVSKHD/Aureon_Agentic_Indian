@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -101,3 +102,45 @@ def test_discover_rejects_duplicates(tmp_path: Path) -> None:
 def test_incomplete_statement_rejected() -> None:
     with pytest.raises(ValueError, match="incomplete"):
         m._split_statements("CREATE TABLE x (a INTEGER)")
+
+
+# --------------------------------------------------------------------------- expand-only rule
+
+DESTRUCTIVE = re.compile(r"\b(DROP|RENAME)\b", re.IGNORECASE)
+ALLOW = re.compile(r"^\s*--\s*allow-destructive:\s*\S", re.IGNORECASE | re.MULTILINE)
+MIGRATIONS_DIR = Path(m.__file__).parent
+
+
+def destructive_violations(directory: Path) -> list[str]:
+    """Migrations must be expand-only so the previous release keeps working after a rollback."""
+    bad: list[str] = []
+    for path in sorted(directory.glob("*.sql")):
+        sql = path.read_text(encoding="utf-8")
+        code = "\n".join(ln for ln in sql.splitlines() if not ln.strip().startswith("--"))
+        if DESTRUCTIVE.search(code) and not ALLOW.search(sql):
+            bad.append(path.name)
+    return bad
+
+
+def test_shipped_migrations_are_expand_only() -> None:
+    assert destructive_violations(MIGRATIONS_DIR) == [], (
+        "DROP/RENAME in a migration breaks rollback to the previous release. "
+        "If unavoidable, add a line '-- allow-destructive: <reason>' (see README 'Migrations')."
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "violates"),
+    [
+        ("DROP TABLE a;", True),
+        ("ALTER TABLE a RENAME COLUMN x TO y;", True),
+        ("alter table a rename to b;", True),
+        ("DROP INDEX i;\n-- allow-destructive:\n", True),  # reason is mandatory
+        ("-- allow-destructive: table unused since 0.3.0\nDROP TABLE old;", False),
+        ("-- we never DROP anything here\nCREATE TABLE a (x INTEGER);", False),
+        ("ALTER TABLE a ADD COLUMN dropped_at TEXT;", False),
+    ],
+)
+def test_destructive_checker(tmp_path: Path, sql: str, violates: bool) -> None:
+    (tmp_path / "0001_x.sql").write_text(sql, encoding="utf-8")
+    assert bool(destructive_violations(tmp_path)) is violates

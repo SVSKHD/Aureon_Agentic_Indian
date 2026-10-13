@@ -54,10 +54,27 @@ def test_evaluate_problems(
     assert any(fragment in p for p in health.evaluate(status, body, **kwargs))
 
 
-def test_strict_tolerates_bad_token_when_market_closed() -> None:
+def test_strict_live_requires_token_even_when_market_closed() -> None:
     body = {**GOOD, "token_ok": False, "market_open": False}
-    assert health.evaluate(200, body, strict=True) == []
-    assert health.evaluate(200, body, strict=False) == []
+    assert any("token_ok" in p for p in health.evaluate(200, body, strict=True))
+    assert health.evaluate(200, {**body, "token_ok": None}, strict=True) != []
+    assert health.evaluate(200, body, strict=False) == []  # non-strict: liveness only
+
+
+def test_strict_replay_requires_null_token() -> None:
+    replay = {**GOOD, "mode": "replay", "token_ok": None}
+    assert health.evaluate(200, replay, strict=True) == []
+    problems = health.evaluate(200, {**replay, "token_ok": True}, strict=True)
+    assert any("null" in p for p in problems)
+
+
+def test_strict_rejects_unknown_mode() -> None:
+    problems = health.evaluate(200, {**GOOD, "mode": "x"}, strict=True)
+    assert any("unknown mode" in p for p in problems)
+
+
+def test_reduced_public_payload_fails_probe() -> None:
+    assert health.evaluate(200, {"status": "ok", "version": "0.1.0"}) != []
 
 
 def test_db_ok(tmp_path: Path) -> None:

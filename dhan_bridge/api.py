@@ -11,14 +11,17 @@ import asyncio
 import contextlib
 import hmac
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Annotated, Any
+from functools import partial
+from typing import IO, Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 
+from dhan_bridge.auth import is_loopback, request_api_key, require_api_key
+from dhan_bridge.backup import acquire_instance_lock
 from dhan_bridge.calendar import now_ist
 from dhan_bridge.config import (
     VERSION,
@@ -38,6 +41,7 @@ from dhan_bridge.instruments import (
     http_fetcher,
     load_universe,
 )
+from dhan_bridge.keys import verify_key
 from dhan_bridge.migrations import migrate
 
 log = logging.getLogger("dhan_bridge")
@@ -56,6 +60,18 @@ class BridgeState:
     resolved: list[Instrument] = field(default_factory=list)
     client: MarketDataClient | None = None
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    lock: IO[str] | None = None
+
+    def spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+        """Start a background task that removes itself from ``tasks`` when done."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self.tasks.append(task)
+        task.add_done_callback(self._forget)
+        return task
+
+    def _forget(self, task: asyncio.Task[None]) -> None:
+        with contextlib.suppress(ValueError):
+            self.tasks.remove(task)
 
     @property
     def live(self) -> bool:
@@ -86,6 +102,20 @@ async def _refresh_scrip_master(state: BridgeState, fetch: Fetcher) -> None:
 
 
 def _startup(
+    settings: Settings, fetch: Fetcher, today: date, client_factory: ClientFactory
+) -> BridgeState:
+    # One instance per data directory: the Dhan feed must exist exactly once.
+    lock = acquire_instance_lock(settings.data_dir)
+    try:
+        state = _startup_locked(settings, fetch, today, client_factory)
+    except BaseException:
+        lock.close()
+        raise
+    state.lock = lock
+    return state
+
+
+def _startup_locked(
     settings: Settings, fetch: Fetcher, today: date, client_factory: ClientFactory
 ) -> BridgeState:
     secrets = SecretsStore(settings.secrets_file)
@@ -140,28 +170,30 @@ def create_app(
         fetch = fetcher or http_fetcher(cfg.scrip_master_url)
         state = _startup(cfg, fetch, now_ist().date(), client_factory)
         app.state.bridge = state
+        app.state.verify_api_key = partial(verify_key, cfg.db_path)
 
         if state.live:
 
             def on_new_secrets(new: DhanSecrets) -> None:
                 state.client = client_factory(new)
-                state.tasks.append(asyncio.get_running_loop().create_task(_recheck(state)))
+                state.spawn(_recheck(state))
 
             state.secrets.add_listener(on_new_secrets)
             await state.monitor.check()
-            state.tasks.append(
-                asyncio.create_task(state.monitor.run_forever(cfg.token_check_interval_s))
-            )
-            state.tasks.append(asyncio.create_task(_refresh_scrip_master(state, fetch)))
-        state.tasks.append(asyncio.create_task(_poll_secrets(state)))
+            state.spawn(state.monitor.run_forever(cfg.token_check_interval_s))
+            state.spawn(_refresh_scrip_master(state, fetch))
+        state.spawn(_poll_secrets(state))
         try:
             yield
         finally:
-            for task in state.tasks:
+            tasks = list(state.tasks)
+            for task in tasks:
                 task.cancel()
-            for task in state.tasks:
+            for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            if state.lock is not None:
+                state.lock.close()
 
     app = FastAPI(title="dhan_bridge", version=VERSION, lifespan=lifespan)
 
@@ -171,7 +203,11 @@ def create_app(
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
+        """Public: ``{status, version}``. Full payload for loopback peers or a valid API key."""
         state = bridge(request)
+        client_host = request.client.host if request.client else None
+        if not is_loopback(client_host) and request_api_key(request) is None:
+            return {"status": "ok", "version": VERSION}
         return health_payload(
             version=VERSION,
             mode=state.settings.bridge_mode,
@@ -202,7 +238,10 @@ def create_app(
             "detail": token.detail if token else "replay mode: token not checked",
         }
 
-    @app.get("/api/universe")
+    # Every /api/* route goes on this router and therefore requires a bearer key.
+    api = APIRouter(prefix="/api", dependencies=[Depends(require_api_key)])
+
+    @api.get("/universe")
     async def universe(request: Request) -> dict[str, Any]:
         state = bridge(request)
         return {
@@ -217,6 +256,7 @@ def create_app(
             ],
         }
 
+    app.include_router(api)
     return app
 
 

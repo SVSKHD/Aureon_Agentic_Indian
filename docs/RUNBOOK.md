@@ -5,13 +5,13 @@ All commands run on the VPS as the `deploy` user in `/opt/dhan_bridge` unless no
 Quick status:
 
 ```bash
-curl -s http://127.0.0.1:8000/health; echo     # loopback, bypasses nginx
+docker exec dhan_bridge python -m dhan_bridge.health probe --strict   # full payload (loopback peer)
 docker ps --filter name=dhan_bridge --format '{{.Image}} {{.Status}}'
 docker logs --tail 100 dhan_bridge
 docker exec dhan_bridge python -m dhan_bridge.calendar status
 ```
 
-`/health` fields:
+Full `/health` fields. Public callers get only `{status, version}`. The full payload needs an API key or a loopback peer, such as `docker exec` as above.
 
 | Field | Meaning |
 |---|---|
@@ -25,7 +25,7 @@ docker exec dhan_bridge python -m dhan_bridge.calendar status
 
 ## 1. Token expired / `token_ok: false`
 
-**Symptoms:** `/health` shows `"token_ok": false`. Logs show `token check: ok=False detail=dhan error DH-901 ...` (invalid or expired token) or `request failed: ...` (network problem). The prod deploy health gate fails during market hours.
+**Symptoms:** `/health` shows `"token_ok": false`. Logs show `token check: ok=False detail=dhan error DH-901 ...` (invalid or expired token) or `request failed: ...` (network problem). In live mode the prod deploy health gate fails whatever the market hours, and Jenkins rolls back. Fix the token on the host before you re-run the release.
 
 1. Find out which kind of failure it is. `dhan error DH-9xx` means the token is bad. `request failed` or `token check raised` means the network or Dhan is down; go to section 2.
 2. Generate a new access token in the Dhan web portal (DhanHQ → Access Token).
@@ -80,22 +80,44 @@ du -sh /opt/dhan_bridge/data/* | sort -h
 
 ## 4. Restore SQLite from a backup
 
-Every startup that applies a migration first writes `data/backups/<version>-<UTC timestamp>.db`. That file is a consistent snapshot taken with SQLite's online backup API.
+Backups in `data/backups/` (all consistent snapshots taken with SQLite's online backup API):
+
+* `<version>-<UTC ts>.db`: taken before migrations, before every deploy, by the nightly off-site job, or by hand.
+* `last-deploy.json`: which backup was taken before the last deploy, plus that deploy's previous tag and schema version.
+
+`data/` belongs to the container user, so run the backup tooling **through the image** rather than with `sudo cp`:
 
 ```bash
 cd /opt/dhan_bridge
-ls -1t data/backups/ | head                      # newest first; pick the one to restore
-docker compose stop bridge
-sudo cp data/bridge.db data/bridge.db.broken-$(date -u +%Y%m%dT%H%M%SZ)
-sudo rm -f data/bridge.db-wal data/bridge.db-shm
-sudo cp data/backups/<file>.db data/bridge.db
-sudo chown 10001:10001 data/bridge.db
-sqlite3 data/bridge.db 'PRAGMA integrity_check; SELECT * FROM schema_migrations;'   # optional
+run() { docker compose run --rm --no-deps -T bridge "$@"; }      # one-off container, same image/volumes/user
+
+run ls -1t /app/data/backups | head                               # newest first
+run python -m dhan_bridge.backup verify <file>.db                 # PRAGMA integrity_check
+docker compose stop bridge                                        # restore refuses while the app runs
+run python -m dhan_bridge.backup restore <file>.db                # keeps a safety copy of the current db
 docker compose up -d bridge
-curl -s http://127.0.0.1:8000/health
+docker exec dhan_bridge python -m dhan_bridge.health probe --strict
 ```
 
-If you restore a backup taken before a migration while running the newer image, the migration is applied again on startup, and a fresh backup is taken first. To stay on the old schema, roll back the image too. See README "Manual rollback".
+`restore --force` works while the app is running. Use it only if you understand that the live process keeps its open connections.
+
+If the backup predates a migration and you keep running the newer image, the migration is re-applied on startup, after a fresh backup. To stay on the old schema, roll back the image too (`bash remote-deploy.sh rollback`, or README "Manual rollback").
+
+**From off-site:** copy the file back into `data/backups/` with `rsync`/`rclone`, then `sudo chown 10001:10001 data/backups/<file>.db`. Verify and restore it as above.
+
+### Off-site backup job failing
+
+```bash
+systemctl status dhan-bridge-offsite-backup.timer
+journalctl -u dhan-bridge-offsite-backup -n 50
+sudo /opt/dhan_bridge/backup-offsite.sh          # run once by hand
+```
+
+Common causes:
+
+* the vault's host key is missing from root's `known_hosts`
+* an expired rclone token (`rclone config reconnect <remote>:`)
+* the bridge is down, so no fresh backup was taken; the job then copies the newest existing one
 
 ## 5. Deploy blocked by market hours
 
@@ -114,6 +136,28 @@ The block is intentional. A restart during market hours drops the live feed and 
 
 ## 6. Prod deploy failed and auto-rollback ran
 
-Jenkins reports `Rollback: rolled back to X (healthy)`. Production is already back on the previous image. Read `reports/` in the build artifacts and `docker logs dhan_bridge` to find the cause.
+Jenkins reports `Rollback: rolled back to X (healthy)`. Production is already back on the previous image. If the failed release had migrated the schema, the pre-deploy backup was restored. Any data written in the few minutes the new release ran is lost, by design. Read `reports/` in the build artifacts and `docker logs dhan_bridge` to find the cause.
 
-If it reports `rollback ... FAILED` or `no previous tag`, act now. Use README "Manual rollback". If the failure was in the database, also use section 4.
+If it reports `rollback FAILED or unhealthy`, act now:
+
+```bash
+cd /opt/dhan_bridge
+run() { docker compose run --rm --no-deps -T bridge "$@"; }
+run python -m dhan_bridge.backup rollback-plan     # PREVIOUS_TAG, schema versions, BACKUP, NEEDS_RESTORE
+bash remote-deploy.sh rollback                     # retry; idempotent
+bash remote-deploy.sh health 120 --strict
+```
+
+* **No deploy record** (`last-deploy.json` missing): set `BRIDGE_TAG=<known good>` in `.env`, then run `docker compose up -d`. If the schema moved, restore manually as in section 4.
+* **Rolling back more than one release:** deploy each previous tag in turn, or restore the backup taken before the oldest of those deploys. The README "Migrations" rule (expand-only) is what makes older images keep working.
+* **Health still fails on the previous tag:** the cause is probably the environment, not the release. Check the token (section 1), the network (section 2) and disk (section 3).
+
+## 7. API key leaked or no longer needed
+
+```bash
+docker exec dhan_bridge python -m dhan_bridge.keys list
+docker exec dhan_bridge python -m dhan_bridge.keys revoke <id>          # effective on the next request
+docker exec dhan_bridge python -m dhan_bridge.keys create vue-frontend  # new key, printed once
+```
+
+Keys are stored only as SHA-256 hashes, so a lost key can't be recovered; revoke it and create a new one. A burst of 401s or 429s in `docker logs` for the nginx service points to a client using a stale key, or to abuse. The nginx limit is 10 r/s per IP with a burst of 20.
