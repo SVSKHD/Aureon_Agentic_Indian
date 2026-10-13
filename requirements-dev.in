@@ -1,0 +1,9 @@
+# Dev/CI dependencies, constrained to the runtime lock. Lock with: make lock
+-c requirements.txt
+pytest
+pytest-cov
+httpx2
+ruff
+mypy
+pip-audit
+pip-tools

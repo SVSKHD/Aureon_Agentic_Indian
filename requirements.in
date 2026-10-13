@@ -1,0 +1,6 @@
+# Runtime dependencies. Lock with: make lock
+dhanhq==2.3.0
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings

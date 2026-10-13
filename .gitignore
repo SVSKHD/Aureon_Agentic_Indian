@@ -1,0 +1,20 @@
+# local environments
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+reports/
+
+# runtime state and secrets: never commit
+data/
+!data/.gitkeep
+.env
+*.env
+!.env.example
+secrets/
+*.key
