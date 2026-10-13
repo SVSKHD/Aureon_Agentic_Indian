@@ -125,17 +125,31 @@ class RedactingFilter(logging.Filter):
     def set_secrets(self, *values: str) -> None:
         self._secrets = tuple(v for v in values if v)
 
+    def _scrub(self, text: str) -> str:
+        for value in self._secrets:
+            text = text.replace(value, mask(value))
+        return text
+
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._secrets:
             return True
         message = record.getMessage()
-        redacted = message
-        for value in self._secrets:
-            redacted = redacted.replace(value, mask(value))
+        redacted = self._scrub(message)
         if redacted != message:
             record.msg = redacted
             record.args = None
+        # Tracebacks: format them now so the scrubbed text is what handlers emit
+        # (logging.Formatter reuses record.exc_text when it is already set).
+        if record.exc_info and not record.exc_text:
+            record.exc_text = _FORMATTER.formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = self._scrub(record.exc_text)
+        if record.stack_info:
+            record.stack_info = self._scrub(record.stack_info)
         return True
+
+
+_FORMATTER = logging.Formatter()
 
 
 REDACTOR = RedactingFilter()

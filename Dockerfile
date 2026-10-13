@@ -47,7 +47,10 @@ VOLUME ["/app/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD ["python", "-m", "dhan_bridge.health", "probe"]
 
-# Exactly ONE worker: the Dhan market feed must exist once per deployment.
+# Exactly ONE worker: the Dhan feed must exist once per deployment (the app also
+# refuses to start if another instance holds data/bridge.lock).
+# --no-proxy-headers: request.client must be the real TCP peer. /health trusts
+# loopback peers, so X-Forwarded-For must never be able to fake 127.0.0.1.
 CMD ["uvicorn", "--factory", "dhan_bridge.api:create_app", \
      "--host", "0.0.0.0", "--port", "8000", "--workers", "1", \
-     "--proxy-headers", "--forwarded-allow-ips", "*", "--no-server-header"]
+     "--no-proxy-headers", "--no-server-header"]

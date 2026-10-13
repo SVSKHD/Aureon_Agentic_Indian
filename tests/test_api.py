@@ -11,18 +11,29 @@ from fastapi.testclient import TestClient
 from dhan_bridge.api import create_app
 from dhan_bridge.config import VERSION, DhanSecrets, Settings
 from dhan_bridge.dhan_client import MarketDataClient
+from dhan_bridge.keys import create_key
 from tests.conftest import FakeClient, write_secrets
 
 HEALTH_KEYS = {"version", "mode", "token_ok", "feed", "market_open", "db_ok"}
 ADMIN = {"X-Admin-Key": "correct-horse-battery"}
 
 
+LOOPBACK = ("127.0.0.1", 50000)
+
+
 def app_for(
     settings: Settings,
     scrip_csv: str,
     factory: Callable[[DhanSecrets], MarketDataClient] = FakeClient,
+    client: tuple[str, int] = LOOPBACK,
 ) -> TestClient:
-    return TestClient(create_app(settings, client_factory=factory, fetcher=lambda: scrip_csv))
+    app = create_app(settings, client_factory=factory, fetcher=lambda: scrip_csv)
+    return TestClient(app, client=client)
+
+
+def bearer(settings: Settings, name: str = "test") -> dict[str, str]:
+    _, key = create_key(settings.db_path, name)
+    return {"Authorization": f"Bearer {key}"}
 
 
 def test_health_live_mode(
@@ -58,7 +69,7 @@ def test_health_replay_mode(
         raise AssertionError("replay mode must not download the scrip master")
 
     app = create_app(make_settings(bridge_mode="replay"), FakeClient, fetcher=must_not_fetch)
-    with TestClient(app) as client:
+    with TestClient(app, client=LOOPBACK) as client:
         response = client.get("/health")
     body = response.json()
     assert response.status_code == 200
@@ -98,8 +109,9 @@ def test_startup_fails_on_unknown_universe_symbol(
 
 
 def test_universe_endpoint(make_settings: Callable[..., Settings], scrip_csv: str) -> None:
-    with app_for(make_settings(), scrip_csv) as client:
-        body = client.get("/api/universe").json()
+    settings = make_settings()
+    with app_for(settings, scrip_csv) as client:
+        body = client.get("/api/universe", headers=bearer(settings)).json()
     assert body["symbols"] == ["NSE:RELIANCE", "NSE:TCS", "NSE:M&M"]
     assert body["resolved"][0] == {
         "symbol": "NSE:RELIANCE",
@@ -172,4 +184,34 @@ def test_file_watch_swaps_token_without_restart(
         while time.monotonic() < deadline and fake_clients[-1].calls == 0:
             time.sleep(0.05)
         assert fake_clients[-1].calls >= 1  # the new token was verified immediately
+        assert client.get("/health").status_code == 200
+
+
+def test_recheck_tasks_remove_themselves(
+    make_settings: Callable[..., Settings], scrip_csv: str, fake_clients: list[FakeClient]
+) -> None:
+    settings = make_settings(secrets_poll_interval_s=3600)
+    with app_for(settings, scrip_csv) as client:
+        state = client.app.state.bridge  # type: ignore[attr-defined]
+        baseline = len(state.tasks)
+        for i in range(5):
+            write_secrets(settings.secrets_file, "1100223344", f"eyJ-rotated-{i}-token-xxxx")
+            assert client.post("/admin/reload-token", headers=ADMIN).json()["changed"] is True
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(state.tasks) != baseline:
+            time.sleep(0.02)
+        assert len(state.tasks) == baseline
+
+
+def test_second_instance_on_same_data_dir_refuses_to_start(
+    make_settings: Callable[..., Settings], scrip_csv: str
+) -> None:
+    settings = make_settings()
+    with (
+        app_for(settings, scrip_csv),
+        pytest.raises(RuntimeError, match="another dhan_bridge instance"),
+        app_for(settings, scrip_csv),
+    ):
+        pass
+    with app_for(settings, scrip_csv) as client:  # lock released on shutdown
         assert client.get("/health").status_code == 200

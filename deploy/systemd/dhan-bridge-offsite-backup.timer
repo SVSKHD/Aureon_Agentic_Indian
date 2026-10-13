@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly off-host dhan_bridge backup (after market close)
+
+[Timer]
+# 23:30 IST, well after the 15:30 close. systemd OnCalendar accepts a time zone.
+OnCalendar=*-*-* 23:30:00 Asia/Kolkata
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

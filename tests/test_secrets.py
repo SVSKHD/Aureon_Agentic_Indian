@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 from pathlib import Path
@@ -130,3 +131,27 @@ def test_read_admin_key(tmp_path: Path) -> None:
     assert read_admin_key(key) is None
     key.write_text("k3y\n", encoding="utf-8")
     assert read_admin_key(key) == "k3y"
+
+
+def test_tracebacks_are_masked(tmp_path: Path) -> None:
+    path = tmp_path / "dhan.env"
+    write_secrets(path, CLIENT_ID, TOKEN)
+    SecretsStore(path).reload()
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(REDACTOR)
+    logger = logging.getLogger("tb-test")
+    logger.addHandler(handler)
+    try:
+        try:
+            raise ValueError(f"bad token {TOKEN} for {CLIENT_ID}")
+        except ValueError:
+            logger.exception("request failed")
+        logger.error("with stack", stack_info=True, extra={"x": TOKEN})
+    finally:
+        logger.removeHandler(handler)
+    text = stream.getvalue()
+    assert "ValueError: bad token" in text  # the traceback is still there...
+    assert TOKEN not in text  # ...but scrubbed
+    assert CLIENT_ID not in text

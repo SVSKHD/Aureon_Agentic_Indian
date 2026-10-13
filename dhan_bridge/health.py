@@ -8,7 +8,8 @@ Probe CLI (used by the Docker HEALTHCHECK, the CI smoke test and deploy gates)::
     python -m dhan_bridge.health probe [--url URL] [--strict] [--expect-mode replay]
                                        [--expect-version 0.1.0]
 
-``--strict`` additionally requires ``db_ok`` and (``token_ok`` or market closed).
+``--strict`` additionally requires ``db_ok`` and, in live mode, ``token_ok == true``
+(regardless of market hours); in replay mode ``token_ok`` must be ``null``.
 Exit 0 when healthy, 1 otherwise.
 """
 
@@ -129,8 +130,16 @@ def evaluate(
     if strict:
         if body.get("db_ok") is not True:
             problems.append("db_ok is not true")
-        if body.get("token_ok") is not True and body.get("market_open") is not False:
-            problems.append("token_ok is not true while the market is open")
+        mode = body.get("mode")
+        if mode == "live":
+            # Regardless of market hours: a deploy with a dead token fails the gate.
+            if body.get("token_ok") is not True:
+                problems.append("live mode requires token_ok == true")
+        elif mode == "replay":
+            if body.get("token_ok") is not None:
+                problems.append("replay mode requires token_ok == null")
+        else:
+            problems.append(f"unknown mode {mode!r}")
     return problems
 
 
