@@ -10,6 +10,7 @@ venv:
 lock:
 	$(PIP_COMPILE) --output-file requirements.txt requirements.in
 	$(PIP_COMPILE) --output-file requirements-dev.txt requirements-dev.in
+	$(PIP_COMPILE) --output-file requirements-ops.txt requirements-ops.in
 
 lint:
 	$(PY) -m ruff check .

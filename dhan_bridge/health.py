@@ -19,17 +19,16 @@ import argparse
 import asyncio
 import json
 import logging
-import sqlite3
 import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from dhan_bridge.calendar import is_market_open, now_ist
+from dhan_bridge.db import PING_TIMEOUT_S, Database
 from dhan_bridge.dhan_client import MarketDataClient, TokenCheck
 
 log = logging.getLogger(__name__)
@@ -74,16 +73,15 @@ class TokenMonitor:
             await self.check()
 
 
-def db_ok(db_path: Path) -> bool:
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-        try:
-            conn.execute("SELECT 1 FROM schema_migrations LIMIT 1")
-        finally:
-            conn.close()
-    except sqlite3.Error:
+async def db_ok(db: Database | None, timeout_s: float = PING_TIMEOUT_S) -> bool:
+    """SELECT 1 within ``timeout_s`` AND alembic current == head. Never raises."""
+    if db is None:
         return False
-    return True
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(db.ok), timeout=timeout_s)
+    except TimeoutError:
+        log.warning("database health check timed out after %.0fs", timeout_s)
+        return False
 
 
 def health_payload(

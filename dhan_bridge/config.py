@@ -1,10 +1,12 @@
-"""Settings and Dhan secrets.
+"""Settings and secrets.
 
-Non-secret settings come from the environment / ``.env``. The Dhan client id and
-access token are read ONLY from a dedicated secrets file (default
-``/run/secrets/dhan.env``) so that they never appear in ``docker inspect``,
-compose files, CI logs or process environments, and so the daily token can be
-rotated by rewriting that file without a restart.
+Non-secret settings come from the environment / ``.env``. Secrets are read ONLY
+from dedicated secrets files so that they never appear in ``docker inspect``,
+compose files, CI logs or process environments, and so they can be rotated by
+rewriting the file without a restart:
+
+* ``/run/secrets/dhan.env``: ``DHAN_CLIENT_ID``, ``DHAN_ACCESS_TOKEN``
+* ``/run/secrets/db.env``:   ``DATABASE_URL`` (a libpq ``postgresql://`` URI)
 """
 
 from __future__ import annotations
@@ -15,7 +17,8 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Generic, Literal, TypeVar
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +29,7 @@ VERSION = __version__
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 BridgeMode = Literal["live", "replay"]
+SslMode = Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
 
 
 class Settings(BaseSettings):
@@ -38,19 +42,29 @@ class Settings(BaseSettings):
     paper_capital: int = Field(default=1_000_000, gt=0)
     admin_key_file: Path = Path("/run/secrets/admin.key")
     secrets_file: Path = Path("/run/secrets/dhan.env")
+    db_secrets_file: Path = Path("/run/secrets/db.env")
+    # Applied when DATABASE_URL has no sslmode. "require" for Supabase/any remote host.
+    db_sslmode: SslMode = "require"
     data_dir: Path = REPO_ROOT / "data"
     holidays_dir: Path = REPO_ROOT / "holidays"
     scrip_master_url: str = "https://images.dhan.co/api-data/api-scrip-master.csv"
     token_check_interval_s: float = Field(default=3600.0, gt=0)
     secrets_poll_interval_s: float = Field(default=5.0, gt=0)
-
-    @property
-    def db_path(self) -> Path:
-        return self.data_dir / "bridge.db"
+    # Daily write to bridge.heartbeat: keeps a free Supabase project from pausing.
+    heartbeat_enabled: bool = True
+    heartbeat_interval_s: float = Field(default=86_400.0, gt=0)
+    # Host-side ops tools (backup.py / dbmove.py)
+    bridge_container: str = "dhan_bridge"
+    pg_tools_image: str = "postgres:{major}-alpine"
+    pg_tools_network: str = "host"
 
     @property
     def backups_dir(self) -> Path:
         return self.data_dir / "backups"
+
+    @property
+    def migrations_log_dir(self) -> Path:
+        return self.data_dir / "migrations-log"
 
 
 # --------------------------------------------------------------------------- secrets
@@ -88,7 +102,44 @@ class DhanSecrets:
         return digest[:10]
 
 
-def parse_secrets_text(text: str) -> DhanSecrets:
+@dataclass(frozen=True)
+class DatabaseSecrets:
+    """``DATABASE_URL`` from db.env. Never logged unmasked."""
+
+    url: str
+
+    def __repr__(self) -> str:
+        return f"DatabaseSecrets(url={mask_url(self.url)!r})"
+
+    __str__ = __repr__
+
+    @property
+    def password(self) -> str:
+        return urlsplit(self.url).password or ""
+
+    @property
+    def host(self) -> str:
+        parts = urlsplit(self.url)
+        return f"{parts.hostname or ''}:{parts.port or 5432}/{parts.path.lstrip('/')}"
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self.url.encode()).hexdigest()[:10]
+
+
+DB_URL_SCHEMES = ("postgresql", "postgres", "postgresql+psycopg")
+
+
+def mask_url(url: str) -> str:
+    """``postgresql://user:secret@host/db`` -> ``postgresql://user:****@host/db``."""
+    parts = urlsplit(url)
+    if parts.password is None:
+        return url
+    netloc = parts.netloc.replace(f":{parts.password}@", ":****@", 1)
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
+def _parse_key_values(text: str) -> dict[str, str]:
     """Parse ``KEY=VALUE`` lines. Blank lines and ``#`` comments are ignored."""
     values: dict[str, str] = {}
     for raw in text.splitlines():
@@ -101,18 +152,40 @@ def parse_secrets_text(text: str) -> DhanSecrets:
         if not sep:
             raise SecretsError("malformed line in secrets file (expected KEY=VALUE)")
         values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def parse_secrets_text(text: str) -> DhanSecrets:
+    values = _parse_key_values(text)
     missing = [k for k in ("DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN") if not values.get(k)]
     if missing:
         raise SecretsError(f"secrets file is missing {', '.join(missing)}")
     return DhanSecrets(values["DHAN_CLIENT_ID"], values["DHAN_ACCESS_TOKEN"])
 
 
-def read_secrets_file(path: Path) -> DhanSecrets:
+def parse_db_secrets_text(text: str) -> DatabaseSecrets:
+    url = _parse_key_values(text).get("DATABASE_URL", "")
+    if not url:
+        raise SecretsError("db secrets file is missing DATABASE_URL")
+    parts = urlsplit(url)
+    if parts.scheme not in DB_URL_SCHEMES or not parts.hostname:
+        raise SecretsError("DATABASE_URL must be a postgresql://user:password@host:port/db URL")
+    return DatabaseSecrets(url)
+
+
+def _read(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise SecretsError(f"cannot read secrets file {path}: {exc.strerror}") from None
-    return parse_secrets_text(text)
+
+
+def read_secrets_file(path: Path) -> DhanSecrets:
+    return parse_secrets_text(_read(path))
+
+
+def read_db_secrets_file(path: Path) -> DatabaseSecrets:
+    return parse_db_secrets_text(_read(path))
 
 
 class RedactingFilter(logging.Filter):
@@ -120,10 +193,15 @@ class RedactingFilter(logging.Filter):
 
     def __init__(self) -> None:
         super().__init__()
+        self._by_source: dict[str, tuple[str, ...]] = {}
         self._secrets: tuple[str, ...] = ()
 
-    def set_secrets(self, *values: str) -> None:
-        self._secrets = tuple(v for v in values if v)
+    def set_secrets(self, *values: str, source: str = "dhan") -> None:
+        self._by_source[source] = tuple(v for v in values if v)
+        # longest first, so a URL is masked before the password inside it
+        self._secrets = tuple(
+            sorted({v for vs in self._by_source.values() for v in vs}, key=len, reverse=True)
+        )
 
     def _scrub(self, text: str) -> str:
         for value in self._secrets:
@@ -163,11 +241,11 @@ def install_redactor() -> None:
             handler.addFilter(REDACTOR)
 
 
-Listener = Callable[[DhanSecrets], None]
+T = TypeVar("T", DhanSecrets, DatabaseSecrets)
 
 
-class SecretsStore:
-    """Holds the current Dhan secrets and reloads them when the file changes.
+class WatchedSecrets(Generic[T]):
+    """Holds parsed secrets from one file and reloads them when the file changes.
 
     ``poll()`` is cheap (one ``stat``) and is called periodically by the app; it
     re-reads the file only when its mtime/size/inode changed. ``reload()`` forces
@@ -175,23 +253,27 @@ class SecretsStore:
     when the parsed values actually differ.
     """
 
-    def __init__(self, path: Path) -> None:
+    label = "secrets"
+
+    def __init__(self, path: Path, parse: Callable[[str], T], source: str) -> None:
         self.path = path
+        self._parse: Callable[[str], T] = parse
+        self._source = source
         self._lock = threading.Lock()
-        self._current: DhanSecrets | None = None
+        self._current: T | None = None
         self._stat_key: tuple[int, int, int] | None = None
-        self._listeners: list[Listener] = []
+        self._listeners: list[Callable[[T], None]] = []
 
     @property
-    def current(self) -> DhanSecrets | None:
+    def current(self) -> T | None:
         return self._current
 
-    def require(self) -> DhanSecrets:
+    def require(self) -> T:
         if self._current is None:
-            raise SecretsError(f"Dhan secrets not loaded from {self.path}")
+            raise SecretsError(f"{self.label} not loaded from {self.path}")
         return self._current
 
-    def add_listener(self, listener: Listener) -> None:
+    def add_listener(self, listener: Callable[[T], None]) -> None:
         self._listeners.append(listener)
 
     def _stat(self) -> tuple[int, int, int] | None:
@@ -201,18 +283,21 @@ class SecretsStore:
             return None
         return (st.st_mtime_ns, st.st_size, st.st_ino)
 
+    def _redact_values(self, value: T) -> tuple[str, ...]:
+        raise NotImplementedError
+
     def reload(self) -> bool:
         """Re-read the file. Returns True if the secrets changed. Raises SecretsError."""
         with self._lock:
             stat_key = self._stat()
-            new = read_secrets_file(self.path)
+            new = self._parse(_read(self.path))
             self._stat_key = stat_key
             changed = new != self._current
             self._current = new
         if changed:
-            REDACTOR.set_secrets(new.client_id, new.access_token)
+            REDACTOR.set_secrets(*self._redact_values(new), source=self._source)
             logging.getLogger(__name__).info(
-                "Dhan secrets loaded: %r fingerprint=%s", new, new.fingerprint
+                "%s loaded: %r fingerprint=%s", self.label, new, new.fingerprint
             )
             for listener in self._listeners:
                 listener(new)
@@ -226,9 +311,33 @@ class SecretsStore:
         try:
             return self.reload()
         except SecretsError as exc:
-            # A half-written file during rotation: keep the old token, retry next poll.
-            logging.getLogger(__name__).warning("secrets reload skipped: %s", exc)
+            # A half-written file during rotation: keep the old value, retry next poll.
+            logging.getLogger(__name__).warning("%s reload skipped: %s", self.label, exc)
             return False
+
+
+class SecretsStore(WatchedSecrets[DhanSecrets]):
+    """Dhan credentials (dhan.env)."""
+
+    label = "Dhan secrets"
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, parse_secrets_text, source="dhan")
+
+    def _redact_values(self, value: DhanSecrets) -> tuple[str, ...]:
+        return (value.client_id, value.access_token)
+
+
+class DbSecretsStore(WatchedSecrets[DatabaseSecrets]):
+    """Database URL (db.env)."""
+
+    label = "Database secrets"
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, parse_db_secrets_text, source="db")
+
+    def _redact_values(self, value: DatabaseSecrets) -> tuple[str, ...]:
+        return (value.url, value.password, unquote(value.password))
 
 
 def read_admin_key(path: Path) -> str | None:

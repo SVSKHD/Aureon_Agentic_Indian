@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from dhan_bridge.db import Database
 from dhan_bridge.instruments import (
     InstrumentStore,
     UnknownSymbolsError,
@@ -12,16 +13,13 @@ from dhan_bridge.instruments import (
     normalise_symbol,
     parse_scrip_master,
 )
-from dhan_bridge.migrations import migrate
 from tests.conftest import REPO_ROOT
 
 TODAY = date(2026, 10, 13)
 
 
 @pytest.fixture
-def store(tmp_path: Path, scrip_csv: str) -> InstrumentStore:
-    db = tmp_path / "bridge.db"
-    migrate(db, tmp_path / "backups", "test")
+def store(db: Database, scrip_csv: str) -> InstrumentStore:
     s = InstrumentStore(db)
     s.load_csv(scrip_csv, TODAY)
     return s
@@ -69,9 +67,7 @@ def test_unknown_symbol_fails_clearly(store: InstrumentStore) -> None:
     assert err.value.symbols == ["NSE:NOTASTOCK", "NSE:ALSOFAKE"]
 
 
-def test_refresh_downloads_once_per_day(tmp_path: Path, scrip_csv: str) -> None:
-    db = tmp_path / "bridge.db"
-    migrate(db, tmp_path / "backups", "test")
+def test_refresh_downloads_once_per_day(db: Database, scrip_csv: str) -> None:
     s = InstrumentStore(db)
     calls: list[int] = []
 
@@ -93,10 +89,7 @@ def test_refresh_falls_back_to_stale_cache(store: InstrumentStore) -> None:
     assert store.resolve("NSE:TCS") is not None
 
 
-def test_refresh_without_cache_fails(tmp_path: Path) -> None:
-    db = tmp_path / "bridge.db"
-    migrate(db, tmp_path / "backups", "test")
-
+def test_refresh_without_cache_fails(db: Database) -> None:
     def broken() -> str:
         raise OSError("dns failure")
 
@@ -124,3 +117,30 @@ def test_shipped_nifty50_universe_is_well_formed() -> None:
     symbols = load_universe(REPO_ROOT / "universe" / "nifty50.txt")
     assert len(symbols) == 50
     assert all(s.startswith("NSE:") for s in symbols)
+
+
+def test_load_is_copy_in_one_transaction_and_failure_keeps_old_cache(
+    store: InstrumentStore, scrip_csv: str
+) -> None:
+    before = store.count()
+    # a NUL byte is valid CSV but rejected by Postgres mid-COPY -> whole replacement rolls back
+    bad_csv = scrip_csv + "NSE,E,77,EQUITY,,BAD\x00SYM,1,x,,,,0.05,NA,ES,EQ,X\n"
+    with pytest.raises(Exception):  # noqa: B017, PT011 - any DB error
+        store.load_csv(bad_csv, date(2026, 10, 14))
+    assert store.count() == before
+    assert store.cached_date() == TODAY
+    # and refresh_if_stale falls back to that stale cache
+    assert store.refresh_if_stale(date(2026, 10, 14), lambda: bad_csv) is False
+    assert store.resolve("NSE:RELIANCE") is not None
+
+
+def test_duplicate_keys_in_csv_are_deduplicated(db: Database, scrip_csv: str) -> None:
+    s = InstrumentStore(db)
+    dup = scrip_csv + "NSE,E,2885,EQUITY,,RELIANCE,1.0,Dup,,,,5.0,NA,ES,EQ,DUP\n"
+    assert s.load_csv(dup, TODAY) == s.load_csv(scrip_csv, TODAY)
+
+
+def test_tick_size_is_exact_numeric(store: InstrumentStore) -> None:
+    inst = store.resolve("NSE:RELIANCE")
+    assert inst is not None
+    assert inst.tick_size == 10.0

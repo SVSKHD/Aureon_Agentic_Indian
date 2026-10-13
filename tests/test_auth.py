@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from pathlib import Path
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import pytest
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from starlette.websockets import WebSocketDisconnect
 
 from dhan_bridge import keys
@@ -18,8 +19,8 @@ from dhan_bridge.auth import (
     is_loopback,
     ws_protocol_key,
 )
-from dhan_bridge.config import VERSION, Settings
-from dhan_bridge.migrations import migrate
+from dhan_bridge.config import VERSION, DatabaseSecrets, Settings, read_db_secrets_file
+from dhan_bridge.db import Database, DatabaseUnavailable
 from tests.conftest import FakeClient
 
 LOOPBACK = ("127.0.0.1", 50000)
@@ -27,11 +28,13 @@ REMOTE = ("203.0.113.7", 50000)
 FULL_KEYS = {"version", "mode", "token_ok", "feed", "market_open", "db_ok"}
 
 
-@pytest.fixture
-def db(tmp_path: Path) -> Path:
-    path = tmp_path / "bridge.db"
-    migrate(path, tmp_path / "backups", "test")
-    return path
+@contextmanager
+def app_db(settings: Settings) -> Iterator[Database]:
+    database = Database(read_db_secrets_file(settings.db_secrets_file), "disable")
+    try:
+        yield database
+    finally:
+        database.dispose()
 
 
 def client_for(settings: Settings, scrip_csv: str, client: tuple[str, int] = REMOTE) -> TestClient:
@@ -42,20 +45,22 @@ def client_for(settings: Settings, scrip_csv: str, client: tuple[str, int] = REM
 # --------------------------------------------------------------------------- key store
 
 
-def test_keys_are_stored_hashed(db: Path) -> None:
+def test_keys_are_stored_hashed(db: Database) -> None:
     key_id, key = keys.create_key(db, "vue")
     assert key.startswith("dbk_")
     assert len(key) > 40
-    raw = db.read_bytes()
-    assert key.encode() not in raw
-    assert keys.hash_key(key).encode() in raw
+    with db.connect() as conn:
+        stored = conn.execute(text("SELECT key_hash FROM bridge.api_keys")).scalars().all()
+        dumped = conn.execute(text("SELECT row_to_json(k)::text FROM bridge.api_keys k")).scalar()
+    assert stored == [keys.hash_key(key)]
+    assert key not in str(dumped)
     record = keys.verify_key(db, key)
     assert record is not None
     assert record.id == key_id
     assert record.name == "vue"
 
 
-def test_revoked_unknown_and_malformed_keys_fail(db: Path) -> None:
+def test_revoked_unknown_and_malformed_keys_fail(db: Database) -> None:
     key_id, key = keys.create_key(db, "vue")
     assert keys.revoke_key(db, key_id) is True
     assert keys.revoke_key(db, key_id) is False  # already revoked
@@ -63,35 +68,43 @@ def test_revoked_unknown_and_malformed_keys_fail(db: Path) -> None:
     assert keys.verify_key(db, "dbk_" + "x" * 43) is None
     assert keys.verify_key(db, "not-a-key") is None
     assert keys.verify_key(db, None) is None
-    assert keys.verify_key(db.parent / "missing.db", key) is None
 
 
-def test_keys_cli(db: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert keys.main(["--db", str(db), "create", "frontend"]) == 0
+def test_verify_key_raises_when_database_is_down(db_url: str) -> None:
+    dead = Database(DatabaseSecrets("postgresql://u:p@127.0.0.1:1/x?connect_timeout=1"), "disable")
+    try:
+        with pytest.raises(DatabaseUnavailable):
+            keys.verify_key(dead, "dbk_" + "x" * 43)
+    finally:
+        dead.dispose()
+
+
+def test_keys_cli(db: Database, db_url: str, capsys: pytest.CaptureFixture[str]) -> None:
+    url = ["--db-url", db_url]
+    assert keys.main([*url, "create", "frontend"]) == 0
     out = capsys.readouterr().out
     key = out.strip().splitlines()[-1]
     assert keys.verify_key(db, key) is not None
 
-    assert keys.main(["--db", str(db), "list"]) == 0
+    assert keys.main([*url, "list"]) == 0
     listing = capsys.readouterr().out
     assert "frontend" in listing
     assert "active" in listing
     assert key not in listing
     assert keys.hash_key(key) not in listing
 
-    assert keys.main(["--db", str(db), "revoke", "1"]) == 0
-    assert keys.main(["--db", str(db), "revoke", "1"]) == 1
-    assert keys.main(["--db", str(db), "list"]) == 0
+    assert keys.main([*url, "revoke", "1"]) == 0
+    assert keys.main([*url, "revoke", "1"]) == 1
+    assert keys.main([*url, "list"]) == 0
     assert "revoked" in capsys.readouterr().out
-    assert keys.main(["--db", str(db), "create", "  "]) == 2
+    assert keys.main([*url, "create", "  "]) == 2
 
 
-def test_keys_cli_on_unmigrated_db(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert keys.main(["--db", str(tmp_path / "none.db"), "list"]) == 2
-    empty = tmp_path / "empty.db"
-    empty.write_bytes(b"")
-    assert keys.main(["--db", str(empty), "list"]) == 2
+def test_keys_cli_on_unmigrated_db(db_url: str, capsys: pytest.CaptureFixture[str]) -> None:
+    assert keys.main(["--db-url", db_url, "list"]) == 2
     assert "migrate" in capsys.readouterr().err
+    assert keys.main(["--db-url", "postgresql://u:p@127.0.0.1:1/x?connect_timeout=1", "list"]) == 2
+    assert keys.main(["--db-url", "not a url", "list"]) == 2
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -116,10 +129,11 @@ def test_api_rejects_revoked_key_and_accepts_valid(
 ) -> None:
     settings = make_settings()
     with client_for(settings, scrip_csv) as client:
-        key_id, key = keys.create_key(settings.db_path, "vue")
-        auth = {"Authorization": f"Bearer {key}"}
-        assert client.get("/api/universe", headers=auth).status_code == 200
-        keys.revoke_key(settings.db_path, key_id)
+        with app_db(settings) as database:
+            key_id, key = keys.create_key(database, "vue")
+            auth = {"Authorization": f"Bearer {key}"}
+            assert client.get("/api/universe", headers=auth).status_code == 200
+            keys.revoke_key(database, key_id)
         assert client.get("/api/universe", headers=auth).status_code == 401
 
 
@@ -165,7 +179,8 @@ def test_loopback_gets_full_health(
 def test_valid_key_gets_full_health(make_settings: Callable[..., Settings], scrip_csv: str) -> None:
     settings = make_settings()
     with client_for(settings, scrip_csv) as client:
-        _, key = keys.create_key(settings.db_path, "monitoring")
+        with app_db(settings) as database:
+            _, key = keys.create_key(database, "monitoring")
         body = client.get("/health", headers={"Authorization": f"Bearer {key}"}).json()
     assert set(body) == FULL_KEYS
 
@@ -191,7 +206,7 @@ def test_helpers() -> None:
 
 
 @pytest.fixture
-def ws_app(db: Path) -> tuple[TestClient, str, int]:
+def ws_app(db: Database) -> tuple[TestClient, str, int]:
     key_id, key = keys.create_key(db, "ws")
     app = FastAPI()
     app.state.verify_api_key = lambda k: keys.verify_key(db, k)

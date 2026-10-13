@@ -15,16 +15,19 @@ from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date
-from functools import partial
 from typing import IO, Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 
-from dhan_bridge.auth import is_loopback, request_api_key, require_api_key
-from dhan_bridge.backup import acquire_instance_lock
+from dhan_bridge.auth import is_loopback, optional_api_key, require_api_key
 from dhan_bridge.calendar import now_ist
 from dhan_bridge.config import (
     VERSION,
+    DatabaseSecrets,
+    DbSecretsStore,
     DhanSecrets,
     SecretsError,
     SecretsStore,
@@ -32,6 +35,7 @@ from dhan_bridge.config import (
     install_redactor,
     read_admin_key,
 )
+from dhan_bridge.db import Database, DatabaseUnavailable, retry
 from dhan_bridge.dhan_client import MarketDataClient, make_client
 from dhan_bridge.health import TokenMonitor, db_ok, health_payload
 from dhan_bridge.instruments import (
@@ -42,20 +46,25 @@ from dhan_bridge.instruments import (
     load_universe,
 )
 from dhan_bridge.keys import verify_key
-from dhan_bridge.migrations import migrate
+from dhan_bridge.lock import acquire_instance_lock
+from dhan_bridge.models import heartbeat
 
 log = logging.getLogger("dhan_bridge")
 
 ClientFactory = Callable[[DhanSecrets], MarketDataClient]
 SCRIP_REFRESH_CHECK_S = 3600.0
+DB_RECONNECT_S = 30.0
 
 
 @dataclass
 class BridgeState:
     settings: Settings
     secrets: SecretsStore
+    db_secrets: DbSecretsStore
+    db: Database
     instruments: InstrumentStore
     monitor: TokenMonitor
+    migrated: bool = False
     universe: list[str] = field(default_factory=list)
     resolved: list[Instrument] = field(default_factory=list)
     client: MarketDataClient | None = None
@@ -90,15 +99,62 @@ async def _poll_secrets(state: BridgeState) -> None:
     while True:
         await asyncio.sleep(state.settings.secrets_poll_interval_s)
         state.secrets.poll()
+        state.db_secrets.poll()
 
 
 async def _refresh_scrip_master(state: BridgeState, fetch: Fetcher) -> None:
+    def refresh() -> bool:
+        return retry(
+            lambda: state.instruments.refresh_if_stale(now_ist().date(), fetch),
+            what="scrip master refresh",
+        )
+
     while True:
         await asyncio.sleep(SCRIP_REFRESH_CHECK_S)
         try:
-            await asyncio.to_thread(state.instruments.refresh_if_stale, now_ist().date(), fetch)
+            await asyncio.to_thread(refresh)
         except Exception:
-            log.exception("scheduled scrip master refresh failed")
+            log.exception("scheduled scrip master refresh failed; will try again next hour")
+
+
+def write_heartbeat(db: Database, source: str) -> None:
+    """Upsert the single heartbeat row (a tiny daily write)."""
+    stmt = pg_insert(heartbeat).values(id=1, beat_at=func.now(), source=source)
+    with db.begin() as conn:
+        conn.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[heartbeat.c.id],
+                set_={"beat_at": func.now(), "source": stmt.excluded.source},
+            )
+        )
+
+
+async def _heartbeat(state: BridgeState) -> None:
+    source = f"dhan_bridge {VERSION} {state.settings.bridge_mode}"
+    while True:
+        if state.migrated:
+            try:
+                await asyncio.to_thread(
+                    retry, lambda: write_heartbeat(state.db, source), what="heartbeat write"
+                )
+                log.info("heartbeat written")
+            except Exception:
+                log.exception(
+                    "heartbeat failed; next attempt in %.0fs", state.settings.heartbeat_interval_s
+                )
+        await asyncio.sleep(state.settings.heartbeat_interval_s)
+
+
+async def _ensure_migrated(state: BridgeState) -> None:
+    """Replay mode only: keep trying until the database is reachable and migrated."""
+    while not state.migrated:
+        await asyncio.sleep(DB_RECONNECT_S)
+        try:
+            await asyncio.to_thread(state.db.migrate)
+            state.migrated = True
+            log.info("database reachable again and migrated")
+        except (SQLAlchemyError, DatabaseUnavailable) as exc:
+            log.warning("database still unavailable: %s", type(exc).__name__)
 
 
 def _startup(
@@ -118,32 +174,52 @@ def _startup(
 def _startup_locked(
     settings: Settings, fetch: Fetcher, today: date, client_factory: ClientFactory
 ) -> BridgeState:
+    live = settings.bridge_mode == "live"
     secrets = SecretsStore(settings.secrets_file)
     try:
         secrets.reload()
     except SecretsError as exc:
-        if settings.bridge_mode == "live":
+        if live:
             raise RuntimeError(f"startup aborted: {exc}") from None
         log.warning("replay mode: continuing without Dhan secrets (%s)", exc)
 
-    result = migrate(settings.db_path, settings.backups_dir, VERSION)
-    if result.applied:
-        log.info("applied migrations %s (backup: %s)", result.applied, result.backup)
+    # The database is required: db.env must exist in every mode.
+    db_secrets = DbSecretsStore(settings.db_secrets_file)
+    try:
+        db_secrets.reload()
+    except SecretsError as exc:
+        raise RuntimeError(f"startup aborted: {exc}") from None
+    db = Database(db_secrets.require(), settings.db_sslmode)
 
     state = BridgeState(
         settings=settings,
         secrets=secrets,
-        instruments=InstrumentStore(settings.db_path),
+        db_secrets=db_secrets,
+        db=db,
+        instruments=InstrumentStore(db),
         monitor=TokenMonitor(client_getter=lambda: None),
     )
     state.monitor.client_getter = lambda: state.client
     state.universe = load_universe(settings.universe_file)
 
-    if state.live:
+    # Live: fail fast if the database is unreachable. Replay: start anyway and
+    # keep retrying in the background (db_ok stays false until it works).
+    try:
+        db.migrate()
+        state.migrated = True
+    except (SQLAlchemyError, DatabaseUnavailable) as exc:
+        if live:
+            db.dispose()
+            raise RuntimeError(
+                f"startup aborted: database {db.secrets.host} unavailable ({type(exc).__name__})"
+            ) from None
+        log.warning("replay mode: database unavailable at startup; retrying in the background")
+
+    if live:
         state.instruments.refresh_if_stale(today, fetch)
         state.resolved = state.instruments.resolve_all(state.universe, str(settings.universe_file))
         state.client = client_factory(secrets.require())
-    elif state.instruments.count() > 0:
+    elif state.migrated and state.instruments.count() > 0:
         state.resolved = state.instruments.resolve_all(state.universe, str(settings.universe_file))
     else:
         log.warning("replay mode: no cached scrip master; universe left unresolved")
@@ -170,7 +246,16 @@ def create_app(
         fetch = fetcher or http_fetcher(cfg.scrip_master_url)
         state = _startup(cfg, fetch, now_ist().date(), client_factory)
         app.state.bridge = state
-        app.state.verify_api_key = partial(verify_key, cfg.db_path)
+        app.state.verify_api_key = lambda key: verify_key(state.db, key)
+
+        def on_new_db_secrets(new: DatabaseSecrets) -> None:
+            state.db.swap(new)
+
+        state.db_secrets.add_listener(on_new_db_secrets)
+        if not state.migrated:
+            state.spawn(_ensure_migrated(state))
+        if cfg.heartbeat_enabled:
+            state.spawn(_heartbeat(state))
 
         if state.live:
 
@@ -192,6 +277,7 @@ def create_app(
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            state.db.dispose()
             if state.lock is not None:
                 state.lock.close()
 
@@ -206,13 +292,13 @@ def create_app(
         """Public: ``{status, version}``. Full payload for loopback peers or a valid API key."""
         state = bridge(request)
         client_host = request.client.host if request.client else None
-        if not is_loopback(client_host) and request_api_key(request) is None:
+        if not is_loopback(client_host) and optional_api_key(request) is None:
             return {"status": "ok", "version": VERSION}
         return health_payload(
             version=VERSION,
             mode=state.settings.bridge_mode,
             token_ok=state.monitor.state.ok if state.live else None,
-            database_ok=db_ok(state.settings.db_path),
+            database_ok=await db_ok(state.db),
         )
 
     @app.post("/admin/reload-token")

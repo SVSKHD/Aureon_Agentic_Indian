@@ -9,7 +9,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dhan_bridge.api import create_app
-from dhan_bridge.config import VERSION, DhanSecrets, Settings
+from dhan_bridge.config import VERSION, DhanSecrets, Settings, read_db_secrets_file
+from dhan_bridge.db import Database
 from dhan_bridge.dhan_client import MarketDataClient
 from dhan_bridge.keys import create_key
 from tests.conftest import FakeClient, write_secrets
@@ -32,7 +33,11 @@ def app_for(
 
 
 def bearer(settings: Settings, name: str = "test") -> dict[str, str]:
-    _, key = create_key(settings.db_path, name)
+    db = Database(read_db_secrets_file(settings.db_secrets_file), "disable")
+    try:
+        _, key = create_key(db, name)
+    finally:
+        db.dispose()
     return {"Authorization": f"Bearer {key}"}
 
 
