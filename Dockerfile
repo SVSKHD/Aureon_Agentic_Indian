@@ -39,7 +39,7 @@ COPY --from=build /opt/venv /opt/venv
 COPY dhan_bridge/ /app/dhan_bridge/
 COPY universe/ /app/universe/
 COPY holidays/ /app/holidays/
-# Lock for the HOST-side ops venv (deploy/ops.sh extracts it with the code, so the
+# Lock for the HOST-side ops venv (scripts/ops.sh extracts it with the code, so the
 # host tools always match the deployed release). Not installed in this image.
 COPY requirements-ops.txt /app/ops/requirements-ops.txt
 RUN mkdir -p /app/data && chown -R bridge:bridge /app/data

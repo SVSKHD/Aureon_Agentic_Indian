@@ -1,8 +1,9 @@
 # Host-side ops tools (backup / verify / restore / db-move). Installed into a venv on
-# the deploy host by deploy/ops.sh; pg_dump & co. run in postgres:<major>-alpine
+# the deploy host by scripts/ops.sh; pg_dump & co. run in postgres:<major>-alpine
 # containers, never on the host or in the bridge image. Constrained to the runtime lock.
 -c requirements.txt
 pydantic-settings
 sqlalchemy>=2.0
 psycopg[binary]>=3.2
 alembic
+pyyaml

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Host-side runner for the database ops tools:
 #
-#   ops.sh backup  now | verify <file> | restore <file> [--force] | rollback-plan | prune | latest
+#   ops.sh backup  now | verify <file> | restore <file> [--force] | offsite <file>
+#                  | rollback-plan | prune [--keep N] | latest
 #   ops.sh dbmove  --target-secrets <db.env> [--dry-run] ...      (see db-move.sh)
-#   ops.sh dbverify fingerprint
+#   ops.sh dbverify compare <a.json> <b.json>
 #
-# Why on the host: pg_dump/pg_restore run in `docker run --rm postgres:<major>-alpine`
-# containers (never in the bridge image), and the backup orchestrator must hold a
-# REPEATABLE READ snapshot open while pg_dump runs, so it needs Python *and* docker.
+# The host never connects to PostgreSQL (the compose database has no published
+# port). The Python tools orchestrate; psql / pg_dump / pg_restore run inside
+# containers: `docker compose exec -T postgres ...` for our own database, and
+# `docker run --rm postgres:<major>-alpine ...` for any other host (db-move targets).
+# Neither the host nor the bridge image needs PostgreSQL client tools.
 #
 # The Python code is copied out of the CURRENTLY CONFIGURED bridge image (BRIDGE_TAG
 # in .env), so host tools always match the deployed release. Dependencies come from
@@ -23,7 +26,9 @@ CONTAINER="${CONTAINER:-dhan_bridge}"
 module="${1:?usage: ops.sh <backup|dbmove|dbverify> [args...]}"; shift
 case "$module" in backup|dbmove|dbverify) ;; *) echo "unknown ops module: $module" >&2; exit 2 ;; esac
 
-image="${OPS_IMAGE:-$(docker compose --project-directory "$APP_DIR" -f "$APP_DIR/docker-compose.yml" config --images bridge)}"
+# exactly the bridge service's image (`config --images bridge` would add postgres: depends_on)
+image="${OPS_IMAGE:-$(docker compose --project-directory "$APP_DIR" -f "$APP_DIR/docker-compose.yml" \
+  config --format json | "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["services"]["bridge"]["image"])')}"
 tag="${image##*:}"
 code="$OPS_DIR/code/$tag"
 if [[ ! -f "$code/.complete" ]]; then
@@ -51,9 +56,15 @@ fi
 sslmode="$(grep -s '^DB_SSLMODE=' "$APP_DIR/bridge.env" | tail -n1 | cut -d= -f2- || true)"
 export DATA_DIR="$APP_DIR/data"
 export DB_SECRETS_FILE="${DB_SECRETS_FILE:-$APP_DIR/secrets/db.env}"
-export DB_SSLMODE="${DB_SSLMODE:-${sslmode:-require}}"
+export DB_SSLMODE="${DB_SSLMODE:-${sslmode:-prefer}}"
 export HOLIDAYS_DIR="$code/holidays"
 export BRIDGE_CONTAINER="$CONTAINER"
+# DATABASE_URL host == DB_SERVICE -> our compose database: tools via `compose exec`
+export DB_SERVICE="${DB_SERVICE:-postgres}"
+# shellcheck disable=SC2016  # single quotes are inside double quotes: they DO expand (quoting for shlex)
+export DB_EXEC_CMD="${DB_EXEC_CMD:-docker compose --project-directory '$APP_DIR' -f '$APP_DIR/docker-compose.yml' exec -T}"
+export DB_EXEC_TARGET="${DB_EXEC_TARGET:-postgres}"
+export BACKUP_TARGETS_FILE="${BACKUP_TARGETS_FILE:-$APP_DIR/config/backup-targets.yaml}"
 export PYTHONPATH="$code"
 export PYTHONDONTWRITEBYTECODE=1
 cd "$APP_DIR"

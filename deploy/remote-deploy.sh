@@ -11,7 +11,8 @@
 # deploy <tag>
 #   1. consistent pg_dump of schema "bridge" BEFORE anything is pulled (ops.sh backup now)
 #      and data/backups/last-deploy.json = {previous_tag, target_tag, alembic_revision, backup}
-#   2. set BRIDGE_TAG, docker compose pull && up -d (the app migrates at startup)
+#   2. set BRIDGE_TAG, docker compose pull && up -d (postgres first: the bridge waits for
+#      its healthcheck; the app migrates at startup)
 # rollback
 #   reads last-deploy.json. If the alembic revision moved since the pre-deploy backup
 #   (the new release migrated), stop bridge and restore that dump first; then start
@@ -25,6 +26,12 @@ CONTAINER="${CONTAINER:-dhan_bridge}"
 cd "$APP_DIR"
 
 compose() { docker compose --project-directory "$APP_DIR" -f "$APP_DIR/docker-compose.yml" "$@"; }
+
+# exactly the bridge service's image (`config --images bridge` would add postgres: depends_on)
+bridge_image() {
+  compose config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["bridge"]["image"])'
+}
 
 valid_tag() { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,128}$ ]]; }
 
@@ -48,11 +55,11 @@ set_tag() {
   fi
 }
 
-OPS="$APP_DIR/ops.sh"   # host-side DB tools (copied here by Jenkins with this script)
+OPS="$APP_DIR/ops.sh"   # host-side DB tools (scripts/ops.sh, copied here by Jenkins)
 
 pre_deploy_backup() {
   local previous="$1" target="$2" rc=0
-  if [[ -z "$previous" ]] || ! docker image inspect "$(compose config --images bridge)" >/dev/null 2>&1; then
+  if [[ -z "$previous" ]] || ! docker image inspect "$(bridge_image)" >/dev/null 2>&1; then
     echo "first deploy on this host: nothing to back up"
     return 0
   fi

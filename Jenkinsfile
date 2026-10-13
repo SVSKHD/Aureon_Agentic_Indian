@@ -3,7 +3,8 @@
 // Agent requirements: python3.11, docker (with access to the daemon that builds
 // the image), git, ssh/scp, curl. gitleaks and trivy run as pinned containers.
 // Tests need real PostgreSQL: they start throwaway postgres:<major>-alpine containers
-// through the same docker daemon (or use TEST_PG_ADMIN_URL if a sidecar is provided).
+// through the same docker daemon (and `docker run --network host` tools containers
+// for the backup / db-move tests), so the agent needs a local docker daemon.
 // Jenkins plugins: Pipeline, Git, SSH Agent, Credentials Binding, JUnit, Coverage,
 // Timestamper, and Basic Branch Build Strategies (to build tags; see README).
 //
@@ -155,11 +156,14 @@ pipeline {
                 stage('DB portability') {
                     steps {
                         mark('DB portability')
-                        // A full db-move between two throwaway PostgreSQL servers (16 -> 17),
-                        // fingerprint-verified, plus fallback/revert paths. Hard gate: if the
-                        // data can't move hosts, the release doesn't ship.
+                        // Hard gate: if the data can't be restored or can't move hosts, the
+                        // release doesn't ship. Real servers only: consistent dump + verify in a
+                        // throwaway postgres, restore/rollback, and a full db-move 16 -> 17
+                        // (older target, non-empty target, market hours, dry run, corrupted
+                        // restore -> fallback, revert), plus the portability rules.
                         sh '''
-                            $PY -m pytest -q tests/test_dbmove.py tests/test_portability.py \
+                            $PY -m pytest -q tests/test_dbmove.py tests/test_backup.py \
+                                tests/test_dbverify.py tests/test_portability.py \
                                 --junitxml=reports/junit-db-portability.xml
                         '''
                     }
@@ -249,7 +253,8 @@ pipeline {
                         mark('Smoke test')
                         // On tags this runs against the promoted (pulled) image. The image talks
                         // to a throwaway postgres on a private docker network, exactly like prod
-                        // talks to Supabase: DATABASE_URL from /run/secrets/db.env.
+                        // talks to the compose "postgres" service: DATABASE_URL from
+                        // /run/secrets/db.env, migrations at startup, strict health gate.
                         sh '''
                             name="dhan-smoke-$BUILD_NUMBER-$GIT_SHA"
                             net="$name-net"; pg="$name-pg"
@@ -262,11 +267,12 @@ pipeline {
                             trap cleanup EXIT
                             docker network create "$net" >/dev/null
                             POSTGRES_PASSWORD="$pgpass" docker run -d --name "$pg" --network "$net" \\
-                                -e POSTGRES_PASSWORD "$(echo "$PG_TEST_IMAGE" | sed 's/{major}/16/')" >/dev/null
+                                -e POSTGRES_PASSWORD -e POSTGRES_USER=bridge -e POSTGRES_DB=bridge \\
+                                "$(echo "$PG_TEST_IMAGE" | sed 's/{major}/16/')" >/dev/null
                             mkdir -p .smoke/secrets
                             printf 'DHAN_CLIENT_ID=0000000000\\nDHAN_ACCESS_TOKEN=smoke-test-not-a-real-token\\n' > .smoke/secrets/dhan.env
-                            printf 'DATABASE_URL=postgresql://postgres:%s@%s:5432/postgres?sslmode=disable\\n' "$pgpass" "$pg" > .smoke/secrets/db.env
-                            for i in $(seq 1 30); do docker exec "$pg" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+                            printf 'DATABASE_URL=postgresql://bridge:%s@%s:5432/bridge\\n' "$pgpass" "$pg" > .smoke/secrets/db.env
+                            for i in $(seq 1 30); do docker exec "$pg" pg_isready -h 127.0.0.1 -U bridge -d bridge >/dev/null 2>&1 && break; sleep 1; done
                             docker create --name "$name" --network "$net" -e BRIDGE_MODE=replay "$IMAGE:$GIT_SHA" >/dev/null
                             # docker cp (not a bind mount) works even when the agent itself runs in a container.
                             docker cp .smoke/secrets "$name:/run/secrets"
@@ -331,7 +337,8 @@ pipeline {
                             sh '''
                                 scp $SSH_OPTS deploy/docker-compose.staging.yml "$STAGING_HOST:$REMOTE_DIR/docker-compose.yml"
                                 scp $SSH_OPTS deploy/nginx.conf "$STAGING_HOST:$REMOTE_DIR/nginx.conf"
-                                scp $SSH_OPTS deploy/remote-deploy.sh deploy/ops.sh deploy/db-move.sh deploy/backup-nightly.sh "$STAGING_HOST:$REMOTE_DIR/"
+                                scp $SSH_OPTS deploy/postgresql.conf "$STAGING_HOST:$REMOTE_DIR/postgresql.conf"
+                                scp $SSH_OPTS deploy/remote-deploy.sh scripts/ops.sh scripts/db-move.sh scripts/backup-nightly.sh "$STAGING_HOST:$REMOTE_DIR/"
                                 ssh $SSH_OPTS "$STAGING_HOST" "bash -s -- deploy $GIT_SHA" < deploy/remote-deploy.sh
                                 ssh $SSH_OPTS "$STAGING_HOST" "bash -s -- health 90 --expect-version $VERSION" < deploy/remote-deploy.sh
                             '''
@@ -418,7 +425,8 @@ pipeline {
                         def ok = sh(returnStatus: true, script: '''
                             scp $SSH_OPTS deploy/docker-compose.prod.yml "$PROD_HOST:$REMOTE_DIR/docker-compose.yml" &&
                             scp $SSH_OPTS deploy/nginx.conf "$PROD_HOST:$REMOTE_DIR/nginx.conf" &&
-                            scp $SSH_OPTS deploy/remote-deploy.sh deploy/ops.sh deploy/db-move.sh deploy/backup-nightly.sh "$PROD_HOST:$REMOTE_DIR/" &&
+                            scp $SSH_OPTS deploy/postgresql.conf "$PROD_HOST:$REMOTE_DIR/postgresql.conf" &&
+                            scp $SSH_OPTS deploy/remote-deploy.sh scripts/ops.sh scripts/db-move.sh scripts/backup-nightly.sh "$PROD_HOST:$REMOTE_DIR/" &&
                             ssh $SSH_OPTS "$PROD_HOST" "bash -s -- deploy $VERSION" < deploy/remote-deploy.sh &&
                             ssh $SSH_OPTS "$PROD_HOST" "bash -s -- health 120 --strict --expect-version $VERSION" < deploy/remote-deploy.sh
                         ''') == 0

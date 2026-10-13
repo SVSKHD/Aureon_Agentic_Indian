@@ -1,6 +1,6 @@
 # dhan_bridge runbook
 
-All commands run on the VPS as the `deploy` user in `/opt/dhan_bridge` unless noted otherwise. The container is called `dhan_bridge`.
+All commands run on the deploy host as the `deploy` user in `/opt/dhan_bridge` unless noted otherwise. The bridge container is called `dhan_bridge`; the database is the compose service `postgres` (no published port: reach it with `docker compose exec postgres ...`).
 
 Quick status:
 
@@ -9,6 +9,7 @@ docker exec dhan_bridge python -m dhan_bridge.health probe --strict   # full pay
 docker ps --filter name=dhan_bridge --format '{{.Image}} {{.Status}}'
 docker logs --tail 100 dhan_bridge
 docker exec dhan_bridge python -m dhan_bridge.calendar status
+docker compose ps postgres                                           # (healthy) = pg_isready ok
 ```
 
 Full `/health` fields. Public callers get only `{status, version}`. The full payload needs an API key or a loopback peer, such as `docker exec` as above.
@@ -57,32 +58,36 @@ In 0.1.0 the feed is `not_started` by design. Until the feed ships, "feed down" 
 3. If the host's DNS or network is broken, fix it on the host. The app re-checks the token hourly. Force an immediate check with `POST /admin/reload-token`, which re-verifies even when the token hasn't changed.
 4. Don't restart in a loop during market hours. Restarts don't fix upstream outages.
 
-## 2b. Supabase / database outage (`db_ok: false`)
+## 2b. Database down (`db_ok: false`)
 
 **Symptoms:** `/health` shows `"db_ok": false`, `/api/*` answers **503** (`database unavailable`, `Retry-After: 30`), and the logs show `database ping failed: OperationalError ...` or `... failed (attempt n/5) ... retrying`.
 
-After startup the app **does not crash** on a database outage. Background writes (the scrip master refresh, the heartbeat) retry with exponential backoff, and the pool reconnects by itself (`pool_pre_ping`). In live mode only **startup** needs the database, and fails fast without it.
+After startup the app **does not crash** on a database outage. Background writes (the scrip master refresh) retry with exponential backoff, and the pool reconnects by itself (`pool_pre_ping`). In live mode only **startup** needs the database, and fails fast without it.
 
-1. **Is it Supabase or us?**
+1. **Is the postgres service up?**
    ```bash
    cd /opt/dhan_bridge
-   bash ops.sh dbverify fingerprint >/dev/null && echo "DB reachable from the host"
+   docker compose ps postgres                    # State / (healthy)
+   docker compose logs --tail 50 postgres
+   docker compose exec postgres pg_isready -h 127.0.0.1 -U bridge -d bridge
    docker logs --since 10m dhan_bridge | grep -iE "database|OperationalError" | tail
    ```
-   Check status.supabase.com and the project dashboard. **Free projects pause after 7 days without activity:** if it says *Paused*, click *Restore*. The heartbeat should prevent this, so then also check `HEARTBEAT_ENABLED` and `docker logs dhan_bridge | grep heartbeat`.
-2. **Credentials rotated?** A wrong password shows `password authentication failed`. Update `secrets/db.env` (atomic `mv`, as for `dhan.env`). The app picks it up within 5 s, no restart needed.
-3. **Network:** the session pooler is IPv4 (`*.pooler.supabase.com:5432`). If you switched to the direct URL (`db.<ref>.supabase.co`), it needs IPv6 on the VPS.
-4. **Wrong pooler:** `prepared statement ... does not exist`, a `search_path` problem, or snapshot errors mean someone used the **transaction pooler (port 6543)**. Switch to the session pooler (port 5432).
+   * **Exited / restarting:** read its log. Common causes: disk full (section 3), a broken `postgresql.conf` after an edit (`docker compose logs postgres` names the line), the memory limit (`PG_MEM_LIMIT`, `docker inspect` shows `OOMKilled: true`), or an unreadable `secrets/postgres_password` (must be `70:70`, mode `0400`). Fix, then `docker compose up -d postgres`.
+   * **Healthy but `db_ok` is false:** check the bridge's credentials and revision below.
+2. **Credentials:** `password authentication failed` means `secrets/db.env` and the role's password disagree. The password in `secrets/postgres_password` only applies when the volume is first created. Fix with `docker compose exec postgres psql -U bridge -c "ALTER ROLE bridge PASSWORD '...'"` and an atomic `mv` of a corrected `db.env` (the app picks it up within 5 s, no restart).
+3. **Revision:** `db_ok` also needs `alembic current == head`. `docker exec dhan_bridge python -m dhan_bridge.db current` vs `heads`. A mismatch after a restore of an older dump is fixed by restarting the bridge (it migrates on start).
+4. **After a db-move** the database is elsewhere: check `secrets/db.env` and the remote host instead (network, TLS, `sslmode`).
 5. Nothing needs restarting once the database is back. `db_ok` returns to `true` on the next check. **Do not** restart the bridge in a loop during market hours.
-6. **Long Supabase outage:** move to another host with the newest verified dump (section 8, *From a dump*).
+6. **Volume lost or corrupted:** recreate the service with an empty volume and restore the newest verified dump (section 4), or move to another host (section 8, *From a dump*).
 
 ## 3. Disk full
 
-**Symptoms:** `No space left on device` in the logs or the nightly backup log, the container restarting, or `backup now` failing. The database lives on Supabase, so local disk is images, logs and dumps.
+**Symptoms:** `No space left on device` in the logs or the nightly backup log, a container restarting, `backup now` failing, or postgres refusing writes (`could not extend file`). The database volume (`pgdata`) lives under `/var/lib/docker/volumes`, so a full disk takes the database down too.
 
 ```bash
 df -h /opt/dhan_bridge /var/lib/docker
 du -sh /opt/dhan_bridge/data/* | sort -h
+docker system df -v | grep -E 'pgdata|VOLUME'
 ```
 
 1. **Old images**, usually the biggest win:
@@ -90,16 +95,16 @@ du -sh /opt/dhan_bridge/data/* | sort -h
    docker image ls | grep dhan_bridge
    docker image prune -a --filter "until=168h"     # keeps the running image
    ```
-2. **Database dumps:** the nightly job keeps the newest 30 in `data/backups/`. If you need space urgently, prune harder, keeping at least the newest 3 (they are also off-host):
+2. **Database dumps:** the nightly job keeps the newest 7 in `data/backups/`. If you need space urgently, prune harder, keeping at least the newest 3 (they are also off-site):
    ```bash
    bash ops.sh backup prune --keep 3
    ```
 3. **Container logs** are capped by compose (5 × 20 MB per service). If an older container predates the caps, run `docker compose up -d` to recreate it.
-4. Once space is free, re-run the nightly job by hand (`sudo ./backup-nightly.sh`) so the newest dump is verified and copied.
+4. Once space is free, check `docker compose ps postgres` is healthy and re-run the nightly job by hand (`bash backup-nightly.sh`) so the newest dump is verified and copied. Never delete files inside the `pgdata` volume.
 
 ## 4. Restore the database from a backup
 
-Dumps live in `data/backups/` (copies are off-host). Each `bridge-<ts>.dump` has a `<dump>.fingerprint.json` sidecar taken in the same snapshot.
+Dumps live in `data/backups/` (copies are off-site, see `config/backup-targets.yaml`). Each `bridge-<ts>.dump` has a `<dump>.fingerprint.json` sidecar taken in the same snapshot.
 
 | Prefix | Taken by |
 |---|---|
@@ -107,7 +112,7 @@ Dumps live in `data/backups/` (copies are off-host). Each `bridge-<ts>.dump` has
 | `pre-restore-` | a restore, from the data it replaced |
 | `move-` | `db-move.sh` |
 
-All of this runs **on the host** through `ops.sh`. `pg_restore` runs in a `postgres:<major>-alpine` container.
+All of this runs **on the host** through `ops.sh`, which needs no PostgreSQL client: `pg_restore` runs inside the `postgres` service (`docker compose exec -T postgres`), and `verify` uses a throwaway `postgres:<major>-alpine` container.
 
 ```bash
 cd /opt/dhan_bridge
@@ -122,8 +127,8 @@ bash remote-deploy.sh health 120 --strict
 What `restore` does:
 
 1. It writes a `pre-restore-*.dump` of the current data.
-2. It renames schema `bridge` aside and restores the dump in a single transaction.
-3. It re-enables RLS and checks the restored fingerprint against the sidecar.
+2. It renames schema `bridge` aside, creates an empty `bridge` and runs `pg_restore --clean --if-exists --schema=bridge` in a single transaction.
+3. It checks the restored fingerprint against the sidecar.
 4. It drops the renamed copy only on success. **On any failure it puts the original schema back.**
 
 Tables created after the dump (a newer revision) do **not** survive a restore.
@@ -131,31 +136,31 @@ Tables created after the dump (a newer revision) do **not** survive a restore.
 * **If the dump is older than the running image's head**, the app applies the newer revisions on start. To stay on the old schema, roll back the image too (`bash remote-deploy.sh rollback`).
 * **`--force`** restores while the bridge is running. Avoid it: the live app keeps writing.
 
-**From off-site:** copy the `.dump` **and** its `.fingerprint.json` back into `data/backups/` (`rsync`/`rclone`), then `verify` and `restore` as above. `verify` refuses a dump whose sha256 doesn't match its sidecar.
+**From off-site:** copy the `.dump` **and** its `.fingerprint.json` back into `data/backups/` (`rsync`/`rclone`), then `verify` and `restore` as above. On a new host with an empty volume, start only the database first (`docker compose up -d postgres`), restore, then `docker compose up -d`. `verify` refuses a dump whose sha256 doesn't match its sidecar.
 
-### Nightly backup or verify failed
+### Nightly backup verification failed
 
-You get a Discord alert (if configured) or see it in `systemctl status dhan-bridge-backup-nightly`.
+You get a Discord alert (if `secrets/discord.env` has `DISCORD_WEBHOOK_URL=`) naming the failed step, or a non-zero exit wherever the job's output goes (scheduler log or mail).
 
 ```bash
-journalctl -u dhan-bridge-backup-nightly -n 80
-sudo /opt/dhan_bridge/backup-nightly.sh               # run once by hand; same code path
+cd /opt/dhan_bridge
+bash backup-nightly.sh                                # run once by hand; same code path
 ```
 
-The log says which step failed:
+The output names the step:
 
-* **`backup`:** the database is unreachable (section 2b), `db.env` is unreadable (secrets group/mode, see README), docker can't pull `postgres:<major>-alpine`, or the disk is full (section 3).
+* **`now`:** the postgres service is down or unhealthy (section 2b), `db.env` is unreadable (secrets group/mode, see README), or the disk is full (section 3).
 * **`verify` with `DIFF ...` lines:** **treat the dump as bad.**
   1. Keep it for investigation and do **not** prune by hand.
   2. Run `bash ops.sh backup now` and `bash ops.sh backup verify <new>`.
-  3. If a fresh dump also differs, check the source with `bash ops.sh dbverify fingerprint`, and look for writes that bypassed the app.
+  3. If a fresh dump also differs, compare the two sidecars (`bash ops.sh dbverify compare a.dump.fingerprint.json b.dump.fingerprint.json`) and look for writes that bypassed the app.
   4. A `sha256 mismatch` means the file changed after it was written: disk or copy corruption.
-* **`offsite`:**
-  * the vault's host key is missing from root's `known_hosts`;
-  * an expired rclone token (`rclone config reconnect <remote>:`);
-  * the target is full.
+  5. `verify` failing before any `DIFF` (pulling `postgres:<major>-alpine`, starting the throwaway container) is an environment problem: check `docker pull` and disk.
+* **`offsite`:** the log names each failed target (`off-site copy to <name> failed: ...`):
+  * rsync: the target's host key is missing from `known_hosts` (`StrictHostKeyChecking=yes`), the key path in `config/backup-targets.yaml` is wrong or unreadable, or the target is full;
+  * rclone: an expired token (`rclone config reconnect <remote>:`) or a full bucket.
 
-  The local dump is still verified, so fix the copy and re-run.
+  The local dump is still verified; fix the target and run `bash ops.sh backup offsite <dump>`.
 * **`prune`:** harmless. The next night retries.
 
 ## 5. Deploy blocked by market hours
@@ -202,35 +207,36 @@ Keys are stored only as SHA-256 hashes, so a lost key can't be recovered; revoke
 
 ## 8. Moving to another database host
 
-Use this for leaving Supabase, changing region, or recovering from a long outage. **Outside market hours** (09:00–15:45 IST on trading days is blocked).
+Use this to move the data off the compose `postgres` service (another VPS, a managed PostgreSQL), between hosts, or back into the compose service. No code changes: only `db.env`. **Outside market hours** (09:00–15:45 IST on trading days is blocked).
 
-1. **Prepare the target:** PostgreSQL with major version >= the source's (check with `bash ops.sh dbverify fingerprint | grep server_major`), an empty database, and a role that can create schemas. No extensions are needed.
-   * For a Supabase target, use the **session pooler** URL. Leave `bridge` out of the exposed Data API schemas.
-   * For any other host, use `sslmode=require` and allow the VPS IP.
+1. **Prepare the target:** PostgreSQL with major version >= the source's (source: `docker compose exec postgres psql -U bridge -tAc 'SHOW server_version'`), an empty database, and a role that owns it (it must be able to create schema `bridge`). No extensions are needed.
+   * Use `sslmode=verify-full` (or at least `require`) for anything outside this host, and allow this host's IP.
+   * The tools reach the target from a `postgres:<major>-alpine` container on docker's default network, and the bridge from its compose network: both must be able to resolve and reach the target host.
+   * To move back **into** the compose service, the target URL is `postgresql://bridge:<password>@postgres:5432/bridge`, and its `bridge` schema must be empty (or pass `--overwrite-target`).
 2. **Write the target's `db.env`** somewhere safe, readable by group bridge:
    ```bash
-   sudo install -m 0440 -o deploy -g bridge /dev/stdin /opt/dhan_bridge/target-db.env <<< 'DATABASE_URL=postgresql://user:pass@new-host:5432/db?sslmode=require'
+   sudo install -m 0440 -o deploy -g bridge /dev/stdin /opt/dhan_bridge/target-db.env <<< 'DATABASE_URL=postgresql://user:pass@new-host:5432/db?sslmode=verify-full'
    ```
 3. **Dry run.** This takes a full copy from a live snapshot and verifies it. The bridge keeps running, `db.env` is untouched, and the copy on the target is removed afterwards:
    ```bash
    cd /opt/dhan_bridge
    bash db-move.sh --target-secrets target-db.env --dry-run
    ```
-   Exit 0 means the target accepts the data with identical fingerprints. Exit 2 means preflight refused (the reason is printed; nothing changed).
-4. **The move.** The bridge is stopped for the copy, typically a few seconds to minutes for this data size:
+   Exit 0 means the target accepts the data with identical fingerprints. Exit 2 means preflight refused (the reason is printed; nothing changed): target older than the source, target not empty, market hours, unreachable, or not enough disk.
+4. **The move.** The bridge is stopped for the copy, typically a few seconds for this data size:
    ```bash
    bash db-move.sh --target-secrets target-db.env
    ```
    * `MOVED to <host>`: done. `db.env` now points at the target, and the old one is kept as `db.env.previous`.
    * Exit 1: the copy didn't verify, or the health gate failed. The bridge is back on the **untouched source** and the differences are printed.
    * Exit 3: the fallback itself is unhealthy. Act now (section 2b).
-   * Every run leaves `data/migrations-log/<ts>.json` with both fingerprints, the versions, the duration and the result.
+   * Every run leaves `data/migrations-log/<ts>.json` with both fingerprints (no passwords), the versions, the steps and the result.
 5. **After the move:**
-   * point the nightly backups at the new host (they follow `db.env` automatically);
-   * run `sudo ./backup-nightly.sh` once to get a verified dump of the new host.
-6. **Keep the old host for 2 weeks**, untouched, as the fallback (section 9). `db-move.sh` never modifies or deletes it. After two quiet weeks, delete it by hand: Supabase dashboard → Project settings → *Delete project*, or `DROP SCHEMA bridge CASCADE` on the old server.
+   * backups follow `db.env` automatically (`ops.sh` uses a `docker run` tools container for a remote host);
+   * run `bash backup-nightly.sh` once to get a verified dump of the new host.
+6. **Keep the old database for 2 weeks**, untouched, as the fallback (section 9). `db-move.sh` never modifies or deletes it, and the compose `postgres` service keeps running. After two quiet weeks, retire it by hand: take one last `bash ops.sh backup now` **before** switching away if you want an archive, then remove the service from the compose file and the volume (`docker volume rm dhan_bridge_pgdata`), or `DROP SCHEMA bridge CASCADE` on an old remote server.
 
-**From a dump (source unreachable):** start the bridge on the new host with an empty database. Then copy the newest verified `bridge-*.dump` into `data/backups/` and run `bash ops.sh backup restore <dump>` with `db.env` pointing at the new host.
+**From a dump (source unreachable):** point `db.env` at the new (empty) database, copy the newest verified `bridge-*.dump` and its sidecar into `data/backups/`, stop the bridge and run `bash ops.sh backup restore <dump>`, then start the bridge.
 
 `--force-market-hours --reason "..."` overrides the guard (the reason is logged). `--overwrite-target` replaces a non-empty target schema.
 
@@ -248,3 +254,24 @@ bash db-move.sh --revert
 3. The bridge restarts and the strict health gate runs.
 
 **Writes made on the new host since the move are NOT copied back.** The tool warns about this. If they matter, take a dump of the new host first (`bash ops.sh backup now`, while `db.env` still points there) and restore the relevant data by hand. To move forward again later, run the move again (with `--overwrite-target` if the new host still has the schema).
+
+## 10. CORS origin changes
+
+Browsers may call `/api` and open the WebSocket only from the exact origins in `ALLOWED_ORIGINS` (in `bridge.env`). Symptoms of a missing origin: the browser console shows a CORS error on `/api` (preflight answered 400, no `Access-Control-Allow-Origin`), or the WebSocket handshake fails with **HTTP 403** `origin not allowed` before any key is checked.
+
+```bash
+cd /opt/dhan_bridge
+grep '^ALLOWED_ORIGINS=' bridge.env
+# add or replace the origin: scheme://host[:port] exactly as the browser sends it,
+# no path, no trailing slash, comma-separated
+sed -i 's#^ALLOWED_ORIGINS=.*#ALLOWED_ORIGINS=https://app.example.org,https://staging-app.example.org#' bridge.env
+docker compose up -d bridge                      # re-reads bridge.env (restart; outside market hours)
+bash remote-deploy.sh health 120 --strict
+curl -s -o /dev/null -D - -X OPTIONS -H 'Origin: https://app.example.org' \
+     -H 'Access-Control-Request-Method: GET' http://127.0.0.1:8000/api/universe | grep -i access-control-allow-origin
+```
+
+* An invalid entry (a path, a trailing slash, `https://*.example.org`) makes the app refuse to start with a validation error naming `allowed_origins`: fix the value and start again.
+* `*` is refused in live mode. Replay mode accepts it for local experiments only.
+* Credentials (cookies) are never allowed cross-origin: the Vue app sends the API key in the `Authorization` header (REST) or `Sec-WebSocket-Protocol` / first message (WebSocket).
+* Non-browser clients (curl, scripts) send no `Origin` and are unaffected.

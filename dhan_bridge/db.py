@@ -2,10 +2,12 @@
 
 * SQLAlchemy 2 + psycopg 3, a small sync pool (3 + 2 overflow, pre-ping,
   10 s connect timeout). The URL comes ONLY from ``db.env`` (``DATABASE_URL``, a
-  libpq ``postgresql://`` URI); ``sslmode`` defaults to ``DB_SSLMODE`` (require).
-* Every connection runs ``SET search_path TO bridge`` on connect. This works
-  through Supabase's *session* pooler; the transaction-mode pooler is not
-  supported (SET, advisory locks and pg_export_snapshot need a real session).
+  libpq ``postgresql://`` URI); ``sslmode`` defaults to ``DB_SSLMODE`` (prefer).
+  Any PostgreSQL >= 16 host works unchanged: the compose ``postgres`` service by
+  default, another host after ``scripts/db-move.sh``.
+* Every connection runs ``SET search_path TO bridge`` on connect (nothing is ever
+  created in ``public``). Needs a real session: a transaction-mode pooler
+  (pgbouncer pool_mode=transaction) in front of the server is not supported.
 * :class:`Database` survives outages after startup: ``ping()`` never raises and
   :func:`retry` re-runs failed background writes with exponential backoff.
 
