@@ -18,3 +18,5 @@ data/
 !.env.example
 secrets/
 *.key
+.smoke/
+.discord-payload.json

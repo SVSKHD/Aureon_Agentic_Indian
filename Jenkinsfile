@@ -33,7 +33,7 @@ Ref: ${env.TAG_NAME ?: env.BRANCH_NAME ?: '?'} | Target: ${env.DEPLOY_TARGET ?: 
 ${env.ROLLBACK ? ":rewind: Rollback: ${env.ROLLBACK}\n" : ''}${currentBuild.description ? "Note: ${currentBuild.description}\n" : ''}Stages:
 ${lines.join('\n')}
 ${env.BUILD_URL ?: ''}"""
-    writeFile file: '.discord-payload.json', text: JsonOutput.toJson([username: 'dhan_bridge CI', content: msg.take(1900)])
+    writeFile file: '.discord-payload.json', text: JsonOutput.toJson([username: 'dhan_bridge CI', content: (msg.length() > 1900 ? msg.substring(0, 1900) : msg)])
     withCredentials([string(credentialsId: 'discord-ci-webhook', variable: 'DISCORD_WEBHOOK')]) {
         sh '''curl -fsS -m 15 -H "Content-Type: application/json" -d @.discord-payload.json "$DISCORD_WEBHOOK" \
               || echo "WARNING: Discord notification failed"'''

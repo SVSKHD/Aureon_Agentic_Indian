@@ -14,7 +14,7 @@ services:
     image: ${REGISTRY:?set REGISTRY in .env}/dhan_bridge:${BRIDGE_TAG:?set BRIDGE_TAG in .env}
     # A fixed container_name makes `docker compose up --scale bridge=2` impossible:
     # the Dhan feed must exist exactly once per deployment.
-    container_name: dhan_bridge_staging
+    container_name: dhan_bridge
     restart: unless-stopped
     env_file:
       - path: bridge.env

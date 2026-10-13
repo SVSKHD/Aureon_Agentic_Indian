@@ -8,7 +8,8 @@ ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN python -m venv /opt/venv
 COPY requirements.txt /tmp/requirements.txt
 # --require-hashes: every artifact must match the lock file, or the build fails.
-RUN /opt/venv/bin/pip install --require-hashes --no-deps -r /tmp/requirements.txt
+RUN /opt/venv/bin/pip install --require-hashes --no-deps -r /tmp/requirements.txt \
+ && /opt/venv/bin/pip uninstall --yes setuptools pip
 
 # ---------------------------------------------------------------- runtime stage
 FROM ${PYTHON_IMAGE} AS runtime
@@ -27,7 +28,9 @@ ENV PATH=/opt/venv/bin:$PATH \
     SECRETS_FILE=/run/secrets/dhan.env \
     ADMIN_KEY_FILE=/run/secrets/admin.key
 
-RUN groupadd --system --gid 10001 bridge \
+# The runtime needs no packaging tools: drop them (and their vendored, CVE-prone deps).
+RUN python -m pip uninstall --yes --no-input pip setuptools wheel \
+ && groupadd --system --gid 10001 bridge \
  && useradd --system --uid 10001 --gid bridge --home-dir /app --shell /usr/sbin/nologin bridge
 
 WORKDIR /app
