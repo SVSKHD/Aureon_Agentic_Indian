@@ -1,8 +1,9 @@
 """Throwaway PostgreSQL servers for tests (docker CLI; no SQLite fallback).
 
-* ``TEST_PG_ADMIN_URL`` set -> use that server (e.g. a Jenkins postgres sidecar).
-* otherwise start ``$PG_TEST_IMAGE`` (default ``postgres:16-alpine``) on a random
-  loopback port and remove it at the end of the session.
+Starts ``$PG_TEST_IMAGE`` (default ``postgres:{major}-alpine``) on a random
+loopback port and removes it at the end of the session. The ops tools reach it
+like production: ``docker exec`` into the container (our own database) or a
+``docker run --network host`` tools container (any other host).
 """
 
 from __future__ import annotations
@@ -77,6 +78,10 @@ class PgServer:
         self._databases.append(name)
         return self.url_for(name)
 
+    @property
+    def port(self) -> int:
+        return int(self.admin_url.rsplit(":", 1)[1].split("/", 1)[0])
+
     def url_for(self, database: str) -> str:
         base = self.admin_url.rsplit("/", 1)[0]
         return f"{base}/{database}?sslmode=disable"
@@ -90,10 +95,5 @@ class PgServer:
                 conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
-def from_env_or_start(major: int = 16) -> PgServer:
-    admin = os.environ.get("TEST_PG_ADMIN_URL")
-    if admin:
-        with psycopg.connect(admin) as conn:
-            version = int(conn.execute("SHOW server_version_num").fetchone()[0]) // 10_000  # type: ignore[index]
-        return PgServer(admin, None, version)
+def start(major: int = 16) -> PgServer:
     return PgServer.start(major)

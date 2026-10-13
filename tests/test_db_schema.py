@@ -1,4 +1,4 @@
-"""Schema invariants: everything in "bridge", RLS everywhere, models == revisions."""
+"""Schema invariants: everything in "bridge", models == revisions, expand-only revisions."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 
 from dhan_bridge.db import MIGRATIONS_DIR, Database, head_revision
 from dhan_bridge.models import SCHEMA, metadata
@@ -17,38 +18,32 @@ from tests.conftest import REPO_ROOT
 VERSIONS = MIGRATIONS_DIR / "versions"
 
 
-def test_every_table_is_in_bridge_with_rls(db: Database) -> None:
+def test_every_table_is_in_bridge(db: Database) -> None:
     with db.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT schemaname, tablename, rowsecurity FROM pg_tables"
+                "SELECT schemaname, tablename FROM pg_tables"
                 " WHERE schemaname NOT IN ('pg_catalog', 'information_schema')"
             )
         ).all()
-        policies = conn.execute(
-            text("SELECT count(*) FROM pg_policies WHERE schemaname = 'bridge'")
-        ).scalar_one()
     assert rows, "no tables at all?"
     assert {r.schemaname for r in rows} == {SCHEMA}, "tables outside schema bridge"
-    assert [r.tablename for r in rows if not r.rowsecurity] == [], "RLS not enabled"
-    assert policies == 0, "RLS must be deny-all (no policies) for non-owner roles"
     assert {t.name for t in metadata.sorted_tables} <= {r.tablename for r in rows}
+    assert all(t.schema == SCHEMA for t in metadata.sorted_tables)
 
 
-def test_non_owner_role_sees_nothing(db: Database, db_url: str) -> None:
-    """RLS + revoked schema access: an API-style role cannot read bridge data."""
+def test_other_roles_cannot_use_schema_bridge(db: Database) -> None:
+    """0001 revokes PUBLIC access: only the owning role (the bridge) can reach the data."""
     with db.begin() as conn:
-        conn.execute(text("INSERT INTO bridge.meta (key, value) VALUES ('k', 'v')"))
-        conn.execute(text("DROP ROLE IF EXISTS api_like"))
-        conn.execute(text("CREATE ROLE api_like"))
-        # even an explicit grant does not help: RLS without policies hides every row
-        conn.execute(text("GRANT USAGE ON SCHEMA bridge TO api_like"))
-        conn.execute(text("GRANT SELECT ON bridge.meta TO api_like"))
-    with db.begin() as conn:
-        conn.execute(text("SET LOCAL ROLE api_like"))
-        assert conn.execute(text("SELECT count(*) FROM bridge.meta")).scalar_one() == 0
+        conn.execute(text("DROP ROLE IF EXISTS other_role"))
+        conn.execute(text("CREATE ROLE other_role"))
     with db.connect() as conn:
-        assert conn.execute(text("SELECT count(*) FROM bridge.meta")).scalar_one() == 1  # owner
+        conn.execute(text("SET ROLE other_role"))
+        with pytest.raises(ProgrammingError, match="permission denied for schema bridge"):
+            conn.execute(text("SELECT count(*) FROM bridge.meta"))
+        conn.rollback()
+    with db.begin() as conn:
+        conn.execute(text("DROP ROLE other_role"))
 
 
 def test_models_match_revisions(db: Database) -> None:

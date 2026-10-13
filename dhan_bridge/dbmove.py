@@ -1,6 +1,6 @@
 """Move schema ``bridge`` to another PostgreSQL host with no code change.
 
-Usage (on the deploy host, via ``deploy/db-move.sh``)::
+Usage (on the deploy host, via ``scripts/db-move.sh``)::
 
     db-move.sh --target-secrets /path/target-db.env [--dry-run] [--overwrite-target]
                [--force-market-hours --reason "..."]
@@ -14,7 +14,7 @@ Phases: preflight -> copy -> verify -> switch, each logged to
   target major >= source major; target schema "bridge" absent or empty (else
   ``--overwrite-target``); enough local disk for the dump; source != target.
 * copy: stop the bridge (not in --dry-run, which dumps a live snapshot), consistent
-  dump (backup.consistent_dump), restore into the target, re-enable RLS.
+  dump (backup.consistent_dump), pg_restore into the target.
 * verify: fingerprint(target) == the dump's fingerprint (server_major excluded:
   the target may be newer) and alembic current == head on the target. On any
   mismatch: restart the bridge on the source, report, exit 1.
@@ -25,6 +25,10 @@ Phases: preflight -> copy -> verify -> switch, each logged to
 
 Exit codes: 0 moved (or dry run passed), 1 failed but source restored and healthy,
 2 preflight refused (nothing changed), 3 manual action required.
+
+Like backup.py, this never connects to a database from the host: every database
+step runs in a postgres container (our compose service via ``docker compose exec``,
+other hosts via ``docker run postgres:<major>-alpine``), see dhan_bridge.pgtools.
 """
 
 from __future__ import annotations
@@ -43,20 +47,25 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
-
-from dhan_bridge.backup import ENABLE_RLS_ON_ALL, consistent_dump, restore_into
+from dhan_bridge.backup import consistent_dump, restore_into
 from dhan_bridge.config import (
     DatabaseSecrets,
     SecretsError,
     Settings,
     read_db_secrets_file,
 )
-from dhan_bridge.db import head_revision, make_engine, server_major
-from dhan_bridge.dbverify import alembic_revision, compare, fingerprint
+from dhan_bridge.db import head_revision
+from dhan_bridge.dbverify import compare
 from dhan_bridge.models import SCHEMA
-from dhan_bridge.pgtools import DockerHost
+from dhan_bridge.pgtools import (
+    DockerHost,
+    PgRunner,
+    PgToolError,
+    fingerprint,
+    psql,
+    runner_for,
+    schema_info,
+)
 
 log = logging.getLogger(__name__)
 
@@ -117,42 +126,20 @@ class MoveLog:
 # --------------------------------------------------------------------------- preflight
 
 
-def _server_info(secrets: DatabaseSecrets, sslmode: str) -> dict[str, Any]:
-    engine = make_engine(secrets.url, sslmode)
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            tables = conn.execute(
-                text(
-                    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
-                    " WHERE n.nspname = :s"
-                ),
-                {"s": SCHEMA},
-            ).scalar_one()
-            schema = conn.execute(
-                text("SELECT 1 FROM pg_namespace WHERE nspname = :s"), {"s": SCHEMA}
-            ).scalar()
-            size = conn.execute(
-                text(
-                    "SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0)"
-                    " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
-                    " WHERE n.nspname = :s AND c.relkind IN ('r', 'm')"
-                ),
-                {"s": SCHEMA},
-            ).scalar_one()
-            identity = conn.execute(
-                text("SELECT current_database(), inet_server_addr()::text, inet_server_port()")
-            ).one()
-            return {
-                "host": secrets.host,
-                "server_major": server_major(conn),
-                "schema_exists": bool(schema),
-                "schema_objects": int(tables),
-                "schema_bytes": int(size),
-                "identity": [str(v) for v in identity],
-            }
-    finally:
-        engine.dispose()
+def _server_info(runner: PgRunner, secrets: DatabaseSecrets) -> dict[str, Any]:
+    info = schema_info(runner)
+    identity = psql(
+        runner, "SELECT current_database() || ':' || system_identifier FROM pg_control_system();"
+    )
+    return {
+        "host": secrets.host,
+        "server_major": runner.major,
+        "schema_exists": bool(info["exists"]),
+        "schema_objects": int(info["objects"]),
+        "schema_bytes": int(info["bytes"]),
+        "identity": identity,
+        "tools": runner.label,
+    }
 
 
 def preflight(
@@ -162,7 +149,7 @@ def preflight(
     target: DatabaseSecrets,
     guard: Guard,
     mlog: MoveLog,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[PgRunner, PgRunner, dict[str, Any], dict[str, Any]]:
     if opts.force_market_hours:
         if not opts.reason.strip():
             raise PreflightError("--force-market-hours requires a non-empty --reason")
@@ -179,16 +166,20 @@ def preflight(
         mlog.step("market_hours_ok")
 
     try:
-        src = _server_info(source, settings.db_sslmode)
-    except SQLAlchemyError as exc:
-        raise PreflightError(f"source {source.host} unreachable: {type(exc).__name__}") from None
+        src_runner = runner_for(source.url, settings)
+        src = _server_info(src_runner, source)
+    except PgToolError as exc:
+        raise PreflightError(f"source {source.host} unreachable: {exc}") from None
     try:
-        dst = _server_info(target, settings.db_sslmode)
-    except SQLAlchemyError as exc:
-        raise PreflightError(f"target {target.host} unreachable: {type(exc).__name__}") from None
-    mlog.step("reachable", source=src["host"], target=dst["host"])
+        dst_runner = runner_for(target.url, settings)
+        dst = _server_info(dst_runner, target)
+    except PgToolError as exc:
+        raise PreflightError(f"target {target.host} unreachable: {exc}") from None
+    mlog.step(
+        "reachable", source=src["host"], target=dst["host"], tools=[src["tools"], dst["tools"]]
+    )
 
-    if src["identity"] == dst["identity"] and source.host == target.host:
+    if src["identity"] == dst["identity"]:
         raise PreflightError("source and target are the same database")
     if dst["server_major"] < src["server_major"]:
         raise PreflightError(
@@ -216,7 +207,7 @@ def preflight(
         free_bytes=free,
         needed_bytes=needed,
     )
-    return src, dst
+    return src_runner, dst_runner, src, dst
 
 
 # --------------------------------------------------------------------------- secrets swap
@@ -253,14 +244,9 @@ def restore_previous(db_env: Path) -> None:
     _atomic_write_like(db_env, previous.read_text(encoding="utf-8"), db_env)
 
 
-def drop_target_schema(target: DatabaseSecrets, settings: Settings) -> None:
+def drop_target_schema(runner: PgRunner) -> None:
     """Dry run only: remove the verified copy so the real move starts from empty."""
-    engine = make_engine(target.url, settings.db_sslmode)
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
-    finally:
-        engine.dispose()
+    psql(runner, f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;")
 
 
 # --------------------------------------------------------------------------- move
@@ -285,7 +271,7 @@ def run_move(
     mlog.record.update(source={"host": source.host}, target={"host": target.host})
 
     try:
-        src, dst = preflight(settings, opts, source, target, guard, mlog)
+        src_runner, dst_runner, src, dst = preflight(settings, opts, source, target, guard, mlog)
     except PreflightError as exc:
         mlog.step("preflight_refused", reason=str(exc))
         path = mlog.write(settings.migrations_log_dir, "preflight_refused")
@@ -316,25 +302,23 @@ def run_move(
 
     # copy
     try:
-        dump = consistent_dump(source, settings.backups_dir, settings, prefix="move")
+        dump = consistent_dump(
+            source, settings.backups_dir, settings, prefix="move", runner=src_runner
+        )
         mlog.step("dumped", dump=dump.path.name, revision=dump.fingerprint["alembic_revision"])
         mlog.record["fingerprints"] = {"source": dump.fingerprint}
         # preflight guaranteed the target schema is absent/empty unless --overwrite-target
-        restore_into(dump, target.url, settings, replace_existing=True)
+        restore_into(dst_runner, dump, replace_existing=True)
     except Exception as exc:
         return fallback(f"copy failed: {exc}")
     mlog.step("restored")
 
     # verify (independently of restore_into's own check)
-    engine = make_engine(target.url, settings.db_sslmode)
     try:
-        with engine.begin() as conn:
-            conn.execute(text(ENABLE_RLS_ON_ALL))
-        with engine.connect() as conn:
-            target_fp = fingerprint(conn)
-            target_rev = alembic_revision(conn)
-    finally:
-        engine.dispose()
+        target_fp = fingerprint(dst_runner)
+    except PgToolError as exc:
+        return fallback(f"could not fingerprint the target: {exc}")
+    target_rev = target_fp.get("alembic_revision")
     mlog.record["fingerprints"]["target"] = target_fp
     diffs = compare(dump.fingerprint, target_fp, ignore=["server_major"])
     head = head_revision()
@@ -345,7 +329,7 @@ def run_move(
     mlog.step("verified", revision=target_rev)
 
     if opts.dry_run:
-        drop_target_schema(target, settings)
+        drop_target_schema(dst_runner)
         mlog.step("dry_run_target_cleaned")
         path = mlog.write(settings.migrations_log_dir, "dry_run_ok")
         print(

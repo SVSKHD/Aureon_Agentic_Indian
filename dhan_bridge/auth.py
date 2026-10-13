@@ -2,7 +2,8 @@
 
 * HTTP: ``Authorization: Bearer <key>`` on every ``/api/*`` route
   (:func:`require_api_key`, attached to the ``/api`` router).
-* WebSocket (prepared for P2): :func:`authenticate_websocket` accepts the key
+* WebSocket (prepared for P2): :func:`authenticate_websocket` first rejects any
+  browser Origin not in ALLOWED_ORIGINS (HTTP 403), then accepts the key
   either in ``Sec-WebSocket-Protocol`` (``bearer.<key>``, alongside
   ``dhan-bridge.v1``) or as the first message. Keys in the query string are
   refused outright: query strings end up in nginx access logs.
@@ -16,7 +17,9 @@ import json
 from collections.abc import Callable
 
 from fastapi import HTTPException, Request, WebSocket, status
+from starlette.responses import PlainTextResponse
 
+from dhan_bridge.cors import origin_allowed
 from dhan_bridge.db import DatabaseUnavailable
 from dhan_bridge.keys import ApiKey
 
@@ -127,6 +130,13 @@ async def authenticate_websocket(
     the key) and the key record is returned. On failure the socket is closed and
     None is returned; the caller must simply return.
     """
+    # 1. Origin first: a browser page from an origin we don't serve is refused with
+    #    HTTP 403 before any key is looked at.
+    allowed: list[str] = getattr(websocket.app.state, "allowed_origins", [])
+    if not origin_allowed(websocket.headers.get("origin"), allowed):
+        await websocket.send_denial_response(PlainTextResponse("origin not allowed", 403))
+        return None
+
     verify = _verifier(websocket)
     if QUERY_KEY_PARAMS & {k.lower() for k in websocket.query_params}:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="no keys in URLs")

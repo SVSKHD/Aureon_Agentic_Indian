@@ -5,8 +5,8 @@ Revises: ${down_revision | comma,n}
 Create Date: ${create_date}
 
 Rules (tests enforce them): schema "bridge" only, standard Postgres types,
-no extensions, no Supabase schemas, expand-only (no drop_*/rename without a
-"-- allow-destructive: <reason>" line), and RLS enabled on every new table.
+no extensions, no vendor-specific schemas, expand-only (no drop_*/rename
+without a "# -- allow-destructive: <reason>" line).
 """
 
 from __future__ import annotations

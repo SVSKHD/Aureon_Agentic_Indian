@@ -8,14 +8,13 @@ Portability rules (enforced by tests/test_portability.py):
 * every table lives in schema ``bridge``; nothing in ``public``;
 * only standard Postgres types: money is ``NUMERIC(18,4)``, every timestamp is
   ``TIMESTAMPTZ`` (UTC stored, IST presented);
-* no extensions, no references to Supabase-owned schemas.
+* no extensions, no references to vendor-specific schemas.
 """
 
 from __future__ import annotations
 
 from sqlalchemy import (
     BigInteger,
-    CheckConstraint,
     Column,
     DateTime,
     Identity,
@@ -23,7 +22,6 @@ from sqlalchemy import (
     Integer,
     MetaData,
     Numeric,
-    SmallInteger,
     Table,
     Text,
     text,
@@ -71,13 +69,4 @@ api_keys = Table(
     Column("key_hash", Text, nullable=False, unique=True),
     Column("created_at", Timestamp(), nullable=False, server_default=text("now()")),
     Column("revoked_at", Timestamp(), nullable=True),
-)
-
-heartbeat = Table(
-    "heartbeat",
-    metadata,
-    Column("id", SmallInteger, primary_key=True),
-    Column("beat_at", Timestamp(), nullable=False),
-    Column("source", Text, nullable=False),
-    CheckConstraint("id = 1", name="heartbeat_single_row"),
 )

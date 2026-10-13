@@ -8,10 +8,9 @@ from collections.abc import Callable, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from dhan_bridge.api import create_app, write_heartbeat
+from dhan_bridge.api import create_app
 from dhan_bridge.config import DatabaseSecrets, Settings
 from dhan_bridge.db import Database, retry
 from dhan_bridge.keys import create_key
@@ -166,29 +165,6 @@ def test_retry_gives_up_and_raises(caplog: pytest.LogCaptureFixture) -> None:
     with pytest.raises(OperationalError):
         retry(down, what="scrip refresh", attempts=3, sleep=lambda _: None)
     assert "scrip refresh failed after 3 attempts" in caplog.text
-
-
-def test_heartbeat_upserts_one_row(db: Database) -> None:
-    write_heartbeat(db, "test")
-    write_heartbeat(db, "test 2")
-    with db.connect() as conn:
-        rows = conn.execute(text("SELECT id, source FROM bridge.heartbeat")).all()
-    assert rows == [(1, "test 2")]
-
-
-def test_heartbeat_task_runs_at_startup(
-    make_settings: Callable[..., Settings], scrip_csv: str
-) -> None:
-    settings = make_settings(heartbeat_enabled=True)
-    with app_client(settings, scrip_csv) as client:
-        deadline = time.monotonic() + 5
-        db = client.app.state.bridge.db  # type: ignore[attr-defined]
-        rows = 0
-        while time.monotonic() < deadline and rows == 0:
-            with db.connect() as conn:
-                rows = conn.execute(text("SELECT count(*) FROM bridge.heartbeat")).scalar_one()
-            time.sleep(0.05)
-    assert rows == 1
 
 
 def test_database_url_is_masked_everywhere(db_url: str) -> None:

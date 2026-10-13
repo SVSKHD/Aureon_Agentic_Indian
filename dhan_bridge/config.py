@@ -17,11 +17,11 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, Literal, TypeVar
+from typing import Annotated, Generic, Literal, TypeVar
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 __version__ = "0.1.0"
 VERSION = __version__
@@ -43,20 +43,60 @@ class Settings(BaseSettings):
     admin_key_file: Path = Path("/run/secrets/admin.key")
     secrets_file: Path = Path("/run/secrets/dhan.env")
     db_secrets_file: Path = Path("/run/secrets/db.env")
-    # Applied when DATABASE_URL has no sslmode. "require" for Supabase/any remote host.
-    db_sslmode: SslMode = "require"
+    # Applied when DATABASE_URL has no sslmode. "prefer": TLS when the server offers it
+    # (our compose Postgres on an internal network doesn't); set "require" for remote hosts.
+    db_sslmode: SslMode = "prefer"
+    # Browser origins allowed to call /api and open /ws, comma-separated, exact
+    # (scheme://host[:port]). "*" is refused in live mode.
+    allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     data_dir: Path = REPO_ROOT / "data"
     holidays_dir: Path = REPO_ROOT / "holidays"
     scrip_master_url: str = "https://images.dhan.co/api-data/api-scrip-master.csv"
     token_check_interval_s: float = Field(default=3600.0, gt=0)
     secrets_poll_interval_s: float = Field(default=5.0, gt=0)
-    # Daily write to bridge.heartbeat: keeps a free Supabase project from pausing.
-    heartbeat_enabled: bool = True
-    heartbeat_interval_s: float = Field(default=86_400.0, gt=0)
-    # Host-side ops tools (backup.py / dbmove.py)
+    # Host-side ops tools (backup.py / dbmove.py). pg_dump & co. run in containers:
+    #  * our own database (DATABASE_URL host == DB_SERVICE): `<DB_EXEC_CMD> <DB_EXEC_TARGET> ...`
+    #  * any other host: `docker run --rm --network <PG_TOOLS_NETWORK> <PG_TOOLS_IMAGE>`
     bridge_container: str = "dhan_bridge"
+    db_service: str = "postgres"
+    db_exec_cmd: str = "docker compose exec -T"
+    db_exec_target: str = "postgres"
     pg_tools_image: str = "postgres:{major}-alpine"
-    pg_tools_network: str = "host"
+    pg_tools_network: str = "bridge"
+    backup_targets_file: Path = REPO_ROOT / "config" / "backup-targets.yaml"
+    backup_keep: int = Field(default=7, ge=1)
+
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [o.strip() for o in value.split(",") if o.strip()]
+        return value
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _exact_origins(cls, origins: list[str]) -> list[str]:
+        for origin in origins:
+            if origin == "*":
+                continue
+            parts = urlsplit(origin)
+            if (
+                parts.scheme not in ("http", "https")
+                or not parts.hostname
+                or parts.path not in ("", "/")
+                or parts.query
+                or parts.fragment
+                or "*" in origin
+                or origin.endswith("/")
+            ):
+                raise ValueError(f"invalid origin {origin!r}: use scheme://host[:port]")
+        return origins
+
+    @model_validator(mode="after")
+    def _no_wildcard_in_live(self) -> Settings:
+        if self.bridge_mode == "live" and "*" in self.allowed_origins:
+            raise ValueError('ALLOWED_ORIGINS="*" is not allowed in live mode')
+        return self
 
     @property
     def backups_dir(self) -> Path:

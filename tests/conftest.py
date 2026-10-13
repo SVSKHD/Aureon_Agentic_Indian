@@ -12,7 +12,7 @@ import pytest
 from dhan_bridge.config import DatabaseSecrets, DhanSecrets, Settings
 from dhan_bridge.db import Database
 from dhan_bridge.dhan_client import TokenCheck
-from tests.pg import PgServer, from_env_or_start
+from tests.pg import PgServer, start
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REPO_ROOT = Path(__file__).parent.parent
@@ -56,7 +56,7 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(scope="session")
 def pg_server() -> Iterator[PgServer]:
-    server = from_env_or_start(16)
+    server = start(16)
     try:
         yield server
     finally:
@@ -151,7 +151,7 @@ def fake_clients() -> list[FakeClient]:
 
 
 @pytest.fixture
-def make_settings(tmp_path: Path, db_url: str) -> Callable[..., Settings]:
+def make_settings(tmp_path: Path, db_url: str, pg_server: PgServer) -> Callable[..., Settings]:
     secrets_dir = tmp_path / "secrets"
     secrets_dir.mkdir()
     write_db_secrets(secrets_dir / "db.env", db_url)
@@ -167,8 +167,13 @@ def make_settings(tmp_path: Path, db_url: str) -> Callable[..., Settings]:
             "secrets_file": secrets_dir / "dhan.env",
             "db_secrets_file": secrets_dir / "db.env",
             "db_sslmode": "disable",
-            "heartbeat_enabled": False,
             "pg_tools_image": PG_TOOLS_IMAGE,
+            # the ops tools reach the test server like the compose service in prod:
+            # "our" database (this host:port) via docker exec, others via docker run
+            "db_service": f"127.0.0.1:{pg_server.port}",
+            "db_exec_cmd": "docker exec -i",
+            "db_exec_target": pg_server.container,
+            "pg_tools_network": "host",
             "admin_key_file": secrets_dir / "admin.key",
             "data_dir": tmp_path / "data",
             "secrets_poll_interval_s": 0.05,
@@ -178,3 +183,21 @@ def make_settings(tmp_path: Path, db_url: str) -> Callable[..., Settings]:
         return Settings(**values)
 
     return factory
+
+
+OPS_ENV = (
+    "data_dir",
+    "db_secrets_file",
+    "db_sslmode",
+    "pg_tools_image",
+    "pg_tools_network",
+    "db_service",
+    "db_exec_cmd",
+    "db_exec_target",
+)
+
+
+def export_ops_env(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
+    """backup.main()/dbmove.main() build Settings() from the environment, as on the host."""
+    for name in OPS_ENV:
+        monkeypatch.setenv(name.upper(), str(getattr(settings, name)))

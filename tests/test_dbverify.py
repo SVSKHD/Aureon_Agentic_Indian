@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from dhan_bridge import dbverify
+from dhan_bridge import dbverify, pgtools
 from dhan_bridge.db import Database
 from dhan_bridge.instruments import InstrumentStore
+from dhan_bridge.pgtools import ExecRunner
+from tests.pg import PgServer
 
 
 @pytest.fixture
@@ -31,7 +33,7 @@ def test_fingerprint_shape_and_discovery(loaded: Database) -> None:
     assert result["alembic_revision"] == loaded.head
     assert result["server_major"] == 16
     tables = result["tables"]
-    assert set(tables) == {"alembic_version", "api_keys", "heartbeat", "instruments", "meta"}
+    assert set(tables) == {"alembic_version", "api_keys", "instruments", "meta"}
     assert tables["instruments"]["rows"] == 10
     # NUMERIC columns are summed exactly, TIMESTAMPTZ columns get min/max (from metadata)
     assert tables["instruments"]["sum"] == {"tick_size": "75.0000"}
@@ -78,9 +80,9 @@ def test_detects_changed_timestamp(loaded: Database) -> None:
 def test_detects_different_alembic_revision(loaded: Database) -> None:
     before = fp(loaded)
     with loaded.begin() as conn:
-        conn.execute(text("UPDATE bridge.alembic_version SET version_num = '0003_heartbeat'"))
+        conn.execute(text("UPDATE bridge.alembic_version SET version_num = '0099_other'"))
     diffs = dbverify.compare(before, fp(loaded))
-    assert diffs == [f"alembic_revision: {loaded.head!r} != '0003_heartbeat'"]
+    assert diffs == [f"alembic_revision: {loaded.head!r} != '0099_other'"]
 
 
 def test_new_tables_are_covered_automatically(loaded: Database) -> None:
@@ -98,15 +100,24 @@ def test_compare_ignore_and_nested() -> None:
     assert dbverify.compare(a, b, ignore=["server_major"]) == []
 
 
-def test_cli(
-    loaded: Database, db_url: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert dbverify.main(["fingerprint", "--db-url", db_url]) == 0
-    out = capsys.readouterr().out
-    (tmp_path / "a.json").write_text(out)
-    (tmp_path / "b.json").write_text(out)
-    assert dbverify.main(["compare", str(tmp_path / "a.json"), str(tmp_path / "b.json")]) == 0
-    other = json.loads(out)
+def test_cli(loaded: Database, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    a.write_text(dbverify.dumps(fp(loaded)))
+    b.write_text(json.dumps({"dump": "x.dump", "fingerprint": fp(loaded)}))  # a backup sidecar
+    assert dbverify.main(["compare", str(a), str(b)]) == 0
+    other = fp(loaded)
     other["tables"]["meta"]["rows"] += 1
-    (tmp_path / "b.json").write_text(json.dumps(other))
-    assert dbverify.main(["compare", str(tmp_path / "a.json"), str(tmp_path / "b.json")]) == 1
+    b.write_text(json.dumps(other))
+    assert dbverify.main(["compare", str(a), str(b)]) == 1
+    assert "tables.meta.rows" in capsys.readouterr().out
+    assert dbverify.main(["sql"]) == 0
+    assert capsys.readouterr().out == dbverify.PSQL_SCRIPT
+
+
+def test_psql_and_app_fingerprints_are_identical(
+    loaded: Database, db_url: str, pg_server: PgServer
+) -> None:
+    """The ops tools (psql in the postgres container) and the app compute the same thing."""
+    dbname = db_url.rsplit("/", 1)[1].split("?", 1)[0]
+    runner = ExecRunner(["docker", "exec", "-i"], pg_server.container or "", "postgres", dbname)
+    assert pgtools.fingerprint(runner) == fp(loaded)

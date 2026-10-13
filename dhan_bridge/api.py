@@ -18,8 +18,6 @@ from datetime import date
 from typing import IO, Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
-from sqlalchemy import func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from dhan_bridge.auth import is_loopback, optional_api_key, require_api_key
@@ -35,6 +33,7 @@ from dhan_bridge.config import (
     install_redactor,
     read_admin_key,
 )
+from dhan_bridge.cors import ApiCORSMiddleware
 from dhan_bridge.db import Database, DatabaseUnavailable, retry
 from dhan_bridge.dhan_client import MarketDataClient, make_client
 from dhan_bridge.health import TokenMonitor, db_ok, health_payload
@@ -47,7 +46,6 @@ from dhan_bridge.instruments import (
 )
 from dhan_bridge.keys import verify_key
 from dhan_bridge.lock import acquire_instance_lock
-from dhan_bridge.models import heartbeat
 
 log = logging.getLogger("dhan_bridge")
 
@@ -115,34 +113,6 @@ async def _refresh_scrip_master(state: BridgeState, fetch: Fetcher) -> None:
             await asyncio.to_thread(refresh)
         except Exception:
             log.exception("scheduled scrip master refresh failed; will try again next hour")
-
-
-def write_heartbeat(db: Database, source: str) -> None:
-    """Upsert the single heartbeat row (a tiny daily write)."""
-    stmt = pg_insert(heartbeat).values(id=1, beat_at=func.now(), source=source)
-    with db.begin() as conn:
-        conn.execute(
-            stmt.on_conflict_do_update(
-                index_elements=[heartbeat.c.id],
-                set_={"beat_at": func.now(), "source": stmt.excluded.source},
-            )
-        )
-
-
-async def _heartbeat(state: BridgeState) -> None:
-    source = f"dhan_bridge {VERSION} {state.settings.bridge_mode}"
-    while True:
-        if state.migrated:
-            try:
-                await asyncio.to_thread(
-                    retry, lambda: write_heartbeat(state.db, source), what="heartbeat write"
-                )
-                log.info("heartbeat written")
-            except Exception:
-                log.exception(
-                    "heartbeat failed; next attempt in %.0fs", state.settings.heartbeat_interval_s
-                )
-        await asyncio.sleep(state.settings.heartbeat_interval_s)
 
 
 async def _ensure_migrated(state: BridgeState) -> None:
@@ -242,7 +212,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _configure_logging()
-        cfg = settings or Settings()
+        cfg = cfg_now
         fetch = fetcher or http_fetcher(cfg.scrip_master_url)
         state = _startup(cfg, fetch, now_ist().date(), client_factory)
         app.state.bridge = state
@@ -254,8 +224,6 @@ def create_app(
         state.db_secrets.add_listener(on_new_db_secrets)
         if not state.migrated:
             state.spawn(_ensure_migrated(state))
-        if cfg.heartbeat_enabled:
-            state.spawn(_heartbeat(state))
 
         if state.live:
 
@@ -281,7 +249,11 @@ def create_app(
             if state.lock is not None:
                 state.lock.close()
 
+    # Resolved now (not in lifespan): middleware must be installed before startup.
+    cfg_now = settings or Settings()
     app = FastAPI(title="dhan_bridge", version=VERSION, lifespan=lifespan)
+    app.state.allowed_origins = list(cfg_now.allowed_origins)
+    app.add_middleware(ApiCORSMiddleware, allowed_origins=cfg_now.allowed_origins)
 
     def bridge(request: Request) -> BridgeState:
         state: BridgeState = request.app.state.bridge

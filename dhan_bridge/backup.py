@@ -1,22 +1,28 @@
-"""Backups of schema ``bridge``: consistent dump, verification, restore, deploy records.
+"""Backups of schema ``bridge``: consistent dump, verification, restore, off-site copy.
 
-Runs on the deploy HOST (via ``deploy/ops.sh backup ...``), not in the bridge
-container: pg_dump/pg_restore run in ``postgres:<major>-alpine`` containers
-(:mod:`dhan_bridge.pgtools`), with <major> taken from the server.
+Runs on the HOST (``scripts/ops.sh backup ...``). The host never connects to the
+database itself: every database step runs as psql / pg_dump / pg_restore inside
+a postgres container (:mod:`dhan_bridge.pgtools`):
+
+* our own database (``DATABASE_URL`` host == ``DB_SERVICE``, i.e. the compose
+  service ``postgres``): ``docker compose exec -T postgres ...``
+* any other host: ``docker run --rm postgres:<major>-alpine ...`` with the
+  server's major version.
 
 Commands::
 
     now [--record-deploy --previous-tag T --target-tag T] [--prefix P]
     verify <file>             restore into a throwaway plain postgres, compare fingerprints
     restore <file> [--force]  replace schema bridge (refuses while the bridge runs)
+    offsite <file>            copy to every target in config/backup-targets.yaml
     rollback-plan             KEY=VALUE lines for remote-deploy.sh rollback
-    prune [--keep 30]
+    prune [--keep N]          keep the newest N dumps (default BACKUP_KEEP=7)
     latest                    newest dump path
 
-Every dump ``<name>.dump`` has a sidecar ``<name>.dump.fingerprint.json`` taken
-INSIDE the dump's snapshot: a REPEATABLE READ, READ ONLY transaction exports its
-snapshot (``pg_export_snapshot()``), the fingerprint is computed in that
-transaction, and ``pg_dump --snapshot=<id>`` dumps exactly the same data.
+``now`` writes ``<name>.dump`` and ``<name>.dump.fingerprint.json``. The
+fingerprint is taken INSIDE the dump's snapshot: one REPEATABLE READ, READ ONLY
+transaction exports its snapshot, computes the fingerprint and runs
+``pg_dump -Fc --schema=bridge --snapshot=<id>`` while it stays open.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -34,31 +41,32 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, text
+import yaml
 
 from dhan_bridge.config import DatabaseSecrets, Settings, read_db_secrets_file
-from dhan_bridge.db import libpq_url, make_engine, server_major
-from dhan_bridge.dbverify import alembic_revision, compare, fingerprint
+from dhan_bridge.dbverify import compare
 from dhan_bridge.models import SCHEMA
-from dhan_bridge.pgtools import DockerHost, PgTools, ThrowawayPostgres
+from dhan_bridge.pgtools import (
+    DockerHost,
+    PgRunner,
+    ThrowawayPostgres,
+    alembic_revision,
+    fingerprint,
+    psql,
+    restore,
+    runner_for,
+    schema_info,
+)
+from dhan_bridge.pgtools import (
+    consistent_dump as tools_dump,
+)
 
 log = logging.getLogger(__name__)
 
 LAST_DEPLOY = "last-deploy.json"
 SIDECAR_SUFFIX = ".fingerprint.json"
-DEFAULT_KEEP = 30
 EXIT_NO_SCHEMA = 3  # `now`: the database has no bridge schema yet
 TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-ENABLE_RLS_ON_ALL = """
-DO $$
-DECLARE t record;
-BEGIN
-    FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'bridge' LOOP
-        EXECUTE format('ALTER TABLE bridge.%I ENABLE ROW LEVEL SECURITY', t.tablename);
-    END LOOP;
-END
-$$
-"""
 
 
 class BackupError(RuntimeError):
@@ -75,10 +83,6 @@ class Dump:
         fp: dict[str, Any] = self.meta["fingerprint"]
         return fp
 
-    @property
-    def sidecar(self) -> Path:
-        return sidecar_for(self.path)
-
 
 def sidecar_for(dump: Path) -> Path:
     return dump.with_name(dump.name + SIDECAR_SUFFIX)
@@ -92,12 +96,6 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def tools_for(engine: Engine, settings: Settings) -> PgTools:
-    with engine.connect() as conn:
-        major = server_major(conn)
-    return PgTools(major, settings.pg_tools_image, settings.pg_tools_network)
-
-
 # --------------------------------------------------------------------------- dump
 
 
@@ -107,36 +105,26 @@ def consistent_dump(
     settings: Settings,
     *,
     prefix: str = "bridge",
+    runner: PgRunner | None = None,
 ) -> Dump:
     """pg_dump of schema bridge + a fingerprint of exactly the same snapshot."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    engine = make_engine(secrets.url, settings.db_sslmode)
+    runner = runner or runner_for(secrets.url, settings)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    path = out_dir / f"{prefix}-{stamp}.dump"
+    partial = path.with_name(path.name + ".partial")
     try:
-        tools = tools_for(engine, settings)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        path = out_dir / f"{prefix}-{stamp}.dump"
-        partial = path.with_name(path.name + ".partial")
-        with engine.connect() as conn:
-            conn = conn.execution_options(isolation_level="REPEATABLE READ")
-            with conn.begin():
-                conn.execute(text("SET TRANSACTION READ ONLY"))
-                snapshot = conn.execute(text("SELECT pg_export_snapshot()")).scalar_one()
-                fp = fingerprint(conn)
-                with partial.open("wb") as handle:
-                    tools.run(
-                        "pg_dump",
-                        ["-Fc", f"--schema={SCHEMA}", f"--snapshot={snapshot}"],
-                        libpq_url(secrets.url, settings.db_sslmode),
-                        stdout=handle,
-                    )
-        partial.replace(path)
-    finally:
-        engine.dispose()
+        fp = tools_dump(runner, partial)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    partial.replace(path)
     meta = {
         "dump": path.name,
         "dump_sha256": sha256_file(path),
         "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source": secrets.host,
+        "tools": runner.label,
         "fingerprint": fp,
     }
     sidecar_for(path).write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
@@ -153,8 +141,7 @@ def load_dump(path: Path) -> Dump:
     if not sidecar.is_file():
         raise BackupError(f"{sidecar.name} is missing: cannot verify {path.name}")
     meta = json.loads(sidecar.read_text())
-    actual = sha256_file(path)
-    if actual != meta.get("dump_sha256"):
+    if sha256_file(path) != meta.get("dump_sha256"):
         raise BackupError(f"{path.name}: sha256 mismatch (file changed or truncated)")
     return Dump(path, meta)
 
@@ -173,108 +160,127 @@ def list_dumps(backups_dir: Path) -> list[Path]:
     return sorted(backups_dir.glob("*.dump"), key=lambda p: (p.stat().st_mtime, p.name))
 
 
-def prune(backups_dir: Path, keep: int = DEFAULT_KEEP) -> list[Path]:
-    dumps_ = list_dumps(backups_dir)
-    doomed = dumps_[:-keep] if keep > 0 else dumps_
+def prune(backups_dir: Path, keep: int) -> list[Path]:
+    dumps = list_dumps(backups_dir)
+    doomed = dumps[:-keep] if keep > 0 else dumps
     for path in doomed:
         path.unlink()
         sidecar_for(path).unlink(missing_ok=True)
     return doomed
 
 
-# --------------------------------------------------------------------------- restore
+# --------------------------------------------------------------------------- restore / verify
 
 
-def schema_exists(url: str, settings: Settings) -> bool:
-    engine = make_engine(url, settings.db_sslmode)
-    try:
-        with engine.connect() as conn:
-            return bool(
-                conn.execute(
-                    text("SELECT 1 FROM pg_namespace WHERE nspname = :s"), {"s": SCHEMA}
-                ).scalar()
-            )
-    finally:
-        engine.dispose()
+def restore_into(runner: PgRunner, dump: Dump, *, replace_existing: bool) -> None:
+    """Restore ``dump`` with ``pg_restore --clean --if-exists --schema=bridge``.
 
-
-def restore_into(
-    dump: Dump, target_url: str, settings: Settings, *, replace_existing: bool
-) -> list[str]:
-    """Restore ``dump`` into ``target_url`` and return fingerprint differences.
-
-    The existing schema (if any) is renamed aside first, so a failed restore can
-    be undone and tables created after the dump cannot survive it. On success
-    the aside copy is dropped; on any failure the original schema is put back.
+    The existing schema (if any) is first renamed aside and an empty ``bridge``
+    created: a ``--schema`` restore needs the schema to exist (it skips CREATE
+    SCHEMA), and tables created after the dump must not survive the restore. The
+    restored data must match the dump's fingerprint; on any failure the original
+    schema is put back, on success the aside copy is dropped.
     """
-    engine = make_engine(target_url, settings.db_sslmode)
+    if runner.major < int(dump.fingerprint["server_major"]):
+        raise BackupError(
+            f"target server {runner.major} is older than the dump's source "
+            f"({dump.fingerprint['server_major']})"
+        )
     aside = f"{SCHEMA}_pre_restore_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
     renamed = False
+    if schema_info(runner)["exists"]:
+        if not replace_existing:
+            raise BackupError(f'schema "{SCHEMA}" already exists on the target')
+        psql(runner, f"ALTER SCHEMA {SCHEMA} RENAME TO {aside};")
+        renamed = True
     try:
-        tools = tools_for(engine, settings)
-        if tools.major < int(dump.fingerprint["server_major"]):
+        restore(runner, dump.path, pre_sql=f"CREATE SCHEMA {SCHEMA};")
+        diffs = compare(dump.fingerprint, fingerprint(runner), ignore=["server_major"])
+        if diffs:
             raise BackupError(
-                f"target server {tools.major} is older than the dump's source "
-                f"({dump.fingerprint['server_major']})"
+                "restored data does not match the dump's fingerprint: " + "; ".join(diffs[:10])
             )
-        with engine.begin() as conn:
-            exists = conn.execute(
-                text("SELECT 1 FROM pg_namespace WHERE nspname = :s"), {"s": SCHEMA}
-            ).scalar()
-            if exists:
-                if not replace_existing:
-                    raise BackupError(f'schema "{SCHEMA}" already exists on the target')
-                conn.execute(text(f"ALTER SCHEMA {SCHEMA} RENAME TO {aside}"))
-                renamed = True
-        try:
-            with dump.path.open("rb") as handle:
-                tools.run(
-                    "pg_restore",
-                    ["--no-owner", "--no-privileges", "--exit-on-error", "--single-transaction"],
-                    libpq_url(target_url, settings.db_sslmode),
-                    stdin=handle,
-                )
-            with engine.begin() as conn:
-                conn.execute(text(ENABLE_RLS_ON_ALL))
-            with engine.connect() as conn:
-                diffs = compare(dump.fingerprint, fingerprint(conn), ignore=["server_major"])
-            if diffs:
-                raise BackupError(
-                    "restored data does not match the dump's fingerprint: " + "; ".join(diffs[:10])
-                )
-        except BaseException:
-            if renamed:
-                with engine.begin() as conn:
-                    conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
-                    conn.execute(text(f"ALTER SCHEMA {aside} RENAME TO {SCHEMA}"))
-                log.error("restore failed; original schema put back")
-            raise
+    except BaseException:
+        undo = f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;"
         if renamed:
-            with engine.begin() as conn:
-                conn.execute(text(f"DROP SCHEMA {aside} CASCADE"))
-        return diffs
-    finally:
-        engine.dispose()
+            undo += f" ALTER SCHEMA {aside} RENAME TO {SCHEMA};"
+        psql(runner, undo)
+        log.error(
+            "restore failed; %s", "original schema put back" if renamed else "target left empty"
+        )
+        raise
+    if renamed:
+        psql(runner, f"DROP SCHEMA {aside} CASCADE;")
 
 
 def verify_dump(dump: Dump, settings: Settings) -> list[str]:
     """Restore into a throwaway plain postgres:<major>-alpine and compare fingerprints."""
     major = int(dump.fingerprint["server_major"])
-    with ThrowawayPostgres(major, settings.pg_tools_image) as url:
-        engine = make_engine(url, "disable")
-        try:
-            tools = PgTools(major, settings.pg_tools_image, settings.pg_tools_network)
-            with dump.path.open("rb") as handle:
-                tools.run(
-                    "pg_restore",
-                    ["--no-owner", "--no-privileges", "--exit-on-error", "--single-transaction"],
-                    libpq_url(url, "disable"),
-                    stdin=handle,
+    with ThrowawayPostgres(major, settings.pg_tools_image) as runner:
+        restore(runner, dump.path, pre_sql=f"CREATE SCHEMA {SCHEMA};")
+        return compare(dump.fingerprint, fingerprint(runner))
+
+
+# --------------------------------------------------------------------------- off-site
+
+
+@dataclass(frozen=True)
+class Target:
+    name: str
+    kind: str
+    host: str = ""
+    path: str = ""
+    ssh_key: str = ""
+    remote: str = ""
+
+
+def load_targets(path: Path) -> list[Target]:
+    if not path.is_file():
+        return []
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    targets: list[Target] = []
+    for i, item in enumerate(data.get("targets") or []):
+        kind = str(item.get("type", ""))
+        name = str(item.get("name") or f"target-{i}")
+        if kind == "rsync":
+            if not item.get("host") or not item.get("path"):
+                raise BackupError(f"{path}: rsync target {name!r} needs host and path")
+            targets.append(
+                Target(
+                    name, kind, str(item["host"]), str(item["path"]), str(item.get("ssh_key", ""))
                 )
-            with engine.connect() as conn:
-                return compare(dump.fingerprint, fingerprint(conn))
-        finally:
-            engine.dispose()
+            )
+        elif kind == "rclone":
+            if not item.get("remote"):
+                raise BackupError(f"{path}: rclone target {name!r} needs remote")
+            targets.append(Target(name, kind, remote=str(item["remote"])))
+        else:
+            raise BackupError(f"{path}: target {name!r} has unknown type {kind!r} (rsync|rclone)")
+    return targets
+
+
+def copy_offsite(files: list[Path], targets: list[Target]) -> list[str]:
+    """Copy ``files`` to every target. Returns the names of targets that failed."""
+    failed: list[str] = []
+    for target in targets:
+        if target.kind == "rsync":
+            ssh = "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
+            if target.ssh_key:
+                ssh += f" -i {target.ssh_key}"
+            cmd = ["rsync", "-t", "--partial", "-e", ssh, *map(str, files),
+                   f"{target.host}:{target.path.rstrip('/')}/"]  # fmt: skip
+            cmds = [cmd]
+        else:
+            cmds = [["rclone", "copy", "--no-traverse", str(f), target.remote] for f in files]
+        for cmd in cmds:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+            if proc.returncode != 0:
+                log.error("off-site copy to %s failed: %s", target.name, proc.stderr.strip()[-500:])
+                failed.append(target.name)
+                break
+        else:
+            log.info("copied %d file(s) to %s (%s)", len(files), target.name, target.kind)
+    return failed
 
 
 # --------------------------------------------------------------------------- deploy record
@@ -310,7 +316,7 @@ class RollbackPlan:
         return self.current_revision != self.recorded_revision
 
 
-def rollback_plan(secrets: DatabaseSecrets, backups_dir: Path, settings: Settings) -> RollbackPlan:
+def rollback_plan(runner: PgRunner, backups_dir: Path) -> RollbackPlan:
     path = backups_dir / LAST_DEPLOY
     try:
         data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
@@ -320,12 +326,7 @@ def rollback_plan(secrets: DatabaseSecrets, backups_dir: Path, settings: Setting
     backup = str(data.get("backup", ""))
     if not TAG_RE.match(previous) or not backup or "/" in backup:
         raise BackupError(f"{path} is malformed")
-    engine = make_engine(secrets.url, settings.db_sslmode)
-    try:
-        with engine.connect() as conn:
-            current = alembic_revision(conn) or ""
-    finally:
-        engine.dispose()
+    current = alembic_revision(runner) or ""
     plan = RollbackPlan(previous, str(data.get("alembic_revision") or ""), current, backup)
     if plan.needs_restore and not (backups_dir / backup).is_file():
         raise BackupError(f"schema changed but pre-deploy backup {backup} is missing")
@@ -348,9 +349,12 @@ def main(argv: Sequence[str] | None = None, host: DockerHost | None = None) -> i
     res = sub.add_parser("restore", help="replace schema bridge with a dump")
     res.add_argument("file")
     res.add_argument("--force", action="store_true", help="restore even if the bridge runs")
+    off = sub.add_parser("offsite", help="copy a dump to every configured off-site target")
+    off.add_argument("file")
+    off.add_argument("--targets", type=Path, help="default: BACKUP_TARGETS_FILE")
     sub.add_parser("rollback-plan", help="KEY=VALUE lines for remote-deploy.sh rollback")
     pr = sub.add_parser("prune")
-    pr.add_argument("--keep", type=int, default=DEFAULT_KEEP)
+    pr.add_argument("--keep", type=int)
     sub.add_parser("latest")
     args = parser.parse_args(argv)
 
@@ -360,13 +364,13 @@ def main(argv: Sequence[str] | None = None, host: DockerHost | None = None) -> i
     host = host or DockerHost(settings.bridge_container)
     try:
         if args.command == "latest":
-            dumps_ = list_dumps(backups_dir)
-            if not dumps_:
+            dumps = list_dumps(backups_dir)
+            if not dumps:
                 raise BackupError(f"no dumps in {backups_dir}")
-            print(dumps_[-1])
+            print(dumps[-1])
             return 0
         if args.command == "prune":
-            for path in prune(backups_dir, args.keep):
+            for path in prune(backups_dir, args.keep or settings.backup_keep):
                 print(f"pruned {path.name}")
             return 0
         if args.command == "verify":
@@ -377,17 +381,32 @@ def main(argv: Sequence[str] | None = None, host: DockerHost | None = None) -> i
             print(("FAILED: " if diffs else "OK: ") + f"{dump.path.name} verified in a throwaway "
                   f"postgres:{dump.fingerprint['server_major']}")  # fmt: skip
             return 1 if diffs else 0
+        if args.command == "offsite":
+            dump = load_dump(resolve_dump(args.file, backups_dir))
+            targets = load_targets(args.targets or settings.backup_targets_file)
+            if not targets:
+                print("WARNING: no off-site targets configured; the dump stays on this host")
+                return 0
+            files = [dump.path, sidecar_for(dump.path)]
+            if (backups_dir / LAST_DEPLOY).is_file():
+                files.append(backups_dir / LAST_DEPLOY)
+            failed = copy_offsite(files, targets)
+            print(f"off-site: {len(targets) - len(failed)}/{len(targets)} target(s) ok")
+            return 1 if failed else 0
 
         secrets = read_db_secrets_file(settings.db_secrets_file)
+        runner = runner_for(secrets.url, settings)
         if args.command == "now":
             if args.record_deploy and (not args.previous_tag or not args.target_tag):
                 parser.error("--record-deploy needs --previous-tag and --target-tag")
-            if not schema_exists(secrets.url, settings):
+            if not schema_info(runner)["exists"]:
                 print(f'database has no schema "{SCHEMA}" yet: nothing to back up')
                 if args.record_deploy:  # never leave a stale record for a later rollback
                     (backups_dir / LAST_DEPLOY).unlink(missing_ok=True)
                 return EXIT_NO_SCHEMA
-            dump = consistent_dump(secrets, backups_dir, settings, prefix=args.prefix)
+            dump = consistent_dump(
+                secrets, backups_dir, settings, prefix=args.prefix, runner=runner
+            )
             print(f"backup={dump.path.name} revision={dump.fingerprint['alembic_revision']}")
             if args.record_deploy:
                 record_deploy(
@@ -404,13 +423,15 @@ def main(argv: Sequence[str] | None = None, host: DockerHost | None = None) -> i
                     "(docker compose stop bridge) or pass --force"
                 )
             dump = load_dump(resolve_dump(args.file, backups_dir))
-            if schema_exists(secrets.url, settings):
-                safety = consistent_dump(secrets, backups_dir, settings, prefix="pre-restore")
+            if schema_info(runner)["exists"]:
+                safety = consistent_dump(
+                    secrets, backups_dir, settings, prefix="pre-restore", runner=runner
+                )
                 print(f"safety backup of the current data: {safety.path.name}")
-            restore_into(dump, secrets.url, settings, replace_existing=True)
+            restore_into(runner, dump, replace_existing=True)
             print(f"restored {dump.path.name}; fingerprint verified")
         else:
-            plan = rollback_plan(secrets, backups_dir, settings)
+            plan = rollback_plan(runner, backups_dir)
             print(f"PREVIOUS_TAG={plan.previous_tag}")
             print(f"RECORDED_REVISION={plan.recorded_revision}")
             print(f"CURRENT_REVISION={plan.current_revision}")

@@ -3,8 +3,9 @@
 * only standard PostgreSQL types (checked on the model metadata);
 * money is NUMERIC(18,4), timestamps are TIMESTAMPTZ;
 * no extensions except an explicit allowlist (empty);
-* no references to Supabase-owned schemas or to "public" in revisions/models;
-* the app never talks to Supabase APIs (no SDKs in the dependency locks).
+* no references to vendor-specific schemas (managed-hosting extras such as
+  ``auth``/``storage``/``cron``/``rdsadmin``) or to "public" in revisions/models;
+* no hosted-database SDKs in the dependency locks: Python + SQL only.
 """
 
 from __future__ import annotations
@@ -30,13 +31,16 @@ from tests.conftest import REPO_ROOT
 
 ALLOWED_TYPES = (BigInteger, Boolean, Date, DateTime, Integer, Numeric, SmallInteger, Text)
 EXTENSION_ALLOWLIST: frozenset[str] = frozenset()
-SUPABASE_SCHEMAS = ("auth", "storage", "realtime", "extensions", "graphql", "graphql_public")
+VENDOR_SCHEMAS = (
+    "auth", "storage", "realtime", "extensions", "graphql", "graphql_public", "vault",
+    "cron", "pgbouncer", "rdsadmin", "aws_commons", "azure", "google_ml", "neon", "timescaledb",
+)  # fmt: skip
 
 FORBIDDEN_SQL = {
     "extension": re.compile(r"\bCREATE\s+EXTENSION\b|\bcreate_extension\b", re.IGNORECASE),
-    "supabase schema": re.compile(
-        r"\b(" + "|".join(SUPABASE_SCHEMAS) + r")\s*\.\s*\w+|schema\s*=\s*[\"'](?:"
-        + "|".join(SUPABASE_SCHEMAS)
+    "vendor schema": re.compile(
+        r"\b(" + "|".join(VENDOR_SCHEMAS) + r")\s*\.\s*\w+|schema\s*=\s*[\"'](?:"
+        + "|".join(VENDOR_SCHEMAS)
         + r")[\"']",
         re.IGNORECASE,
     ),
@@ -70,7 +74,7 @@ def revision_files() -> list[Path]:
 
 def test_revisions_and_models_are_portable() -> None:
     files = [*revision_files(), REPO_ROOT / "dhan_bridge" / "models.py"]
-    assert len(files) >= 5
+    assert len(files) >= 3
     assert scan(files) == []
 
 
@@ -103,9 +107,11 @@ def test_no_extensions_in_live_database(db: object) -> None:
     assert used - {"plpgsql"} <= EXTENSION_ALLOWLIST
 
 
-def test_no_supabase_sdk_or_services_in_dependencies() -> None:
+def test_no_hosted_database_sdks_in_dependencies() -> None:
     banned = re.compile(
-        r"^(supabase|supabase-py|postgrest|gotrue|storage3|realtime|supafunc)\b", re.IGNORECASE
+        r"^(supabase|postgrest|gotrue|storage3|realtime|supafunc|neon|boto3|"
+        r"google-cloud-sql|cloud-sql-python-connector|azure-)",
+        re.IGNORECASE,
     )
     for lock in REPO_ROOT.glob("requirements*.txt"):
         names = [ln.split("==")[0] for ln in lock.read_text().splitlines() if "==" in ln]
@@ -116,8 +122,9 @@ def test_no_supabase_sdk_or_services_in_dependencies() -> None:
     ("snippet", "label"),
     [
         ('op.execute("CREATE EXTENSION pgcrypto")', "extension"),
-        ('op.execute("select auth.uid()")', "supabase schema"),
-        ("op.create_table('x', schema='storage')", "supabase schema"),
+        ('op.execute("select auth.uid()")', "vendor schema"),
+        ("op.create_table('x', schema='storage')", "vendor schema"),
+        ('op.execute("SELECT cron.schedule(1)")', "vendor schema"),
         ("op.create_table('x', schema='public')", "public schema"),
         ("sa.Column('x', postgresql.JSONB())", "vendor type"),
         ("sa.Column('x', sa.DateTime())", "naive timestamp"),

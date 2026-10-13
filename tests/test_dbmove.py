@@ -1,4 +1,9 @@
-"""db-move between real throwaway PostgreSQL servers (no Supabase involved)."""
+"""db-move between real throwaway PostgreSQL servers.
+
+The source is "our" database (docker exec into its container, like the compose
+service); targets are other servers reached by a postgres:<major>-alpine tools
+container. Nothing connects from the host except the tests' own assertions.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +15,12 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from dhan_bridge import backup, dbmove
+from dhan_bridge import backup, dbmove, pgtools
 from dhan_bridge.config import DatabaseSecrets, Settings, read_db_secrets_file
 from dhan_bridge.db import Database
 from dhan_bridge.instruments import InstrumentStore
 from dhan_bridge.keys import create_key, verify_key
-from tests.conftest import FakeHost, write_db_secrets
+from tests.conftest import FakeHost, export_ops_env, write_db_secrets
 from tests.pg import PgServer
 
 ALLOWED = lambda: 0  # noqa: E731 - market-hours guard says "allowed"
@@ -41,13 +46,7 @@ def source(
     make_settings: Callable[..., Settings], scrip_csv: str, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[tuple[Settings, Database, str]]:
     settings = make_settings()
-    for key, value in {
-        "DATA_DIR": settings.data_dir,
-        "DB_SECRETS_FILE": settings.db_secrets_file,
-        "DB_SSLMODE": "disable",
-        "PG_TOOLS_IMAGE": settings.pg_tools_image,
-    }.items():
-        monkeypatch.setenv(key, str(value))
+    export_ops_env(monkeypatch, settings)
     db = Database(read_db_secrets_file(settings.db_secrets_file), "disable")
     db.migrate()
     InstrumentStore(db).load_csv(scrip_csv, date(2026, 10, 13))
@@ -114,7 +113,7 @@ def test_preflight_market_hours(source, pg17: PgServer, tmp_path: Path) -> None:
             "--dry-run",
             "--force-market-hours",
             "--reason",
-            "Supabase outage",
+            "primary host failing",
         ],
         host,
         guard=BLOCKED,
@@ -122,7 +121,7 @@ def test_preflight_market_hours(source, pg17: PgServer, tmp_path: Path) -> None:
     assert code == dbmove.EXIT_OK
     assert logs(settings)[-1]["steps"][0] == {
         **logs(settings)[-1]["steps"][0],
-        "reason": "Supabase outage",
+        "reason": "primary host failing",
     }
 
 
@@ -187,15 +186,11 @@ def test_full_move_succeeds_with_identical_fingerprints(
     assert "password" not in json.dumps(record).lower()
     assert read_db_secrets_file(settings.db_secrets_file).password not in json.dumps(record)
 
-    # the data really is there, keys still work, RLS is on, and the source is untouched
+    # the data really is there, keys still work, and the source is untouched
     target = Database(DatabaseSecrets(url), "disable")
     try:
         assert target.ok()
         assert verify_key(target, key) is not None
-        with target.connect() as conn:
-            assert conn.execute(
-                text("SELECT bool_and(rowsecurity) FROM pg_tables WHERE schemaname='bridge'")
-            ).scalar()
     finally:
         target.dispose()
     assert InstrumentStore(src_db).count() == 10
@@ -211,16 +206,14 @@ def test_corrupted_restore_falls_back_to_source(
     settings, src_db, _ = source
     db_env_before = settings.db_secrets_file.read_bytes()
     url = pg17.create_database()
-    real_run = backup.PgTools.run
+    real_restore = backup.restore
 
-    def corrupting_restore(self, tool, args, dburl, **kw):  # type: ignore[no-untyped-def]
-        result = real_run(self, tool, args, dburl, **kw)
-        if tool == "pg_restore" and dburl.startswith(url.split("?")[0]):
-            with Database(DatabaseSecrets(url), "disable").begin() as conn:
-                conn.execute(text("DELETE FROM bridge.instruments WHERE security_id = '2885'"))
-        return result
+    def corrupting_restore(runner, dump_path, pre_sql=""):  # type: ignore[no-untyped-def]
+        real_restore(runner, dump_path, pre_sql)
+        if isinstance(runner, pgtools.DockerRunner) and runner.url == url:  # target only
+            pgtools.psql(runner, "DELETE FROM bridge.instruments WHERE security_id = '2885';")
 
-    monkeypatch.setattr(backup.PgTools, "run", corrupting_restore)
+    monkeypatch.setattr(backup, "restore", corrupting_restore)
     host = FakeHost(running=True)
     assert (
         move(["--target-secrets", str(target_file(tmp_path, url))], host)
@@ -233,6 +226,13 @@ def test_corrupted_restore_falls_back_to_source(
     assert record["result"] == "failed_source_restored"
     assert any("instruments.rows" in s.get("reason", "") for s in record["steps"])
     assert InstrumentStore(src_db).count() == 10  # source never modified
+    target = Database(DatabaseSecrets(url), "disable")
+    with target.connect() as conn:  # the bad copy was removed from the target
+        assert (
+            conn.execute(text("SELECT count(*) FROM pg_namespace WHERE nspname='bridge'")).scalar()
+            == 0
+        )
+    target.dispose()
 
 
 def test_health_gate_failure_reverts_db_env(source, pg17: PgServer, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

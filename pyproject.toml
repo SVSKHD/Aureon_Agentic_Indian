@@ -14,7 +14,10 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "C4", "PT"]
 ignore = ["S101"]  # asserts are fine in tests
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S105", "S106", "S108", "S603", "S607"]
+"tests/**" = ["S105", "S106", "S108", "S603", "S607", "S608"]
+# SQL built from the constant schema name and our own model metadata only (no input)
+"dhan_bridge/dbverify.py" = ["S608"]
+"dhan_bridge/pgtools.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.11"
